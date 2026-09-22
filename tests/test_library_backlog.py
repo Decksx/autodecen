@@ -34,6 +34,184 @@ def make_cbz(path: Path, comicinfo: str | None = None) -> None:
 
 
 class LibraryBacklogTests(unittest.TestCase):
+    def test_known_types_only_mode_is_opt_in_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state" / "backlog.sqlite3"
+            store = BacklogStore(str(database))
+            self.assertFalse(store.known_types_only())
+            store.control_known_types_only(True)
+            self.assertTrue(BacklogStore(str(database)).known_types_only())
+            self.assertTrue(store.snapshot()["known_types_only"])
+
+    def test_detection_mode_endpoint_persists_setting(self):
+        import api
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = BacklogStore(str(Path(directory) / "backlog.sqlite3"))
+            with patch.object(api.library_backlog, "store", store):
+                response = api.app.test_client().post(
+                    "/api/library-backlog/known-types-only",
+                    json={"enabled": True}, headers={"Origin": "http://localhost:3000"},
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(store.known_types_only())
+
+    def test_detected_book_runs_only_matching_pass_and_persists_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            database = Path(directory) / "state" / "backlog.sqlite3"
+            store = BacklogStore(str(database))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            seen = []
+            store.control_known_types_only(True)
+
+            def detector(path, _job):
+                seen.append(("detect", path))
+                return {"page_count": 2, "pages_by_method": {
+                    "black_bars": [], "transparent_black": [], "white_bars": [],
+                    "mosaic": ["002.jpg"]}, "detected_methods": ["mosaic"]}
+
+            def processor(path, sequence, _job):
+                seen.append(("process", sequence))
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(store, processor, detector=detector)
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(archive))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+
+            self.assertEqual(seen, [("detect", str(archive)), ("process", ["mosaic"])])
+            progress = BacklogStore(str(database)).book_progress(str(archive))
+            self.assertEqual(progress["selected_sequence"], ["mosaic"])
+            self.assertEqual(progress["detected_methods"], ["mosaic"])
+            self.assertEqual(progress["detected_pages"]["mosaic"], ["002.jpg"])
+            recent = store.snapshot()["recent_books"][0]
+            self.assertIsNone(recent["detected_pages"])
+            self.assertEqual(recent["detected_page_counts"]["mosaic"], 1)
+            self.assertIsNotNone(progress["detection_checked_at"])
+            self.assertEqual(progress["stages"][0]["state"], "not_selected")
+
+    def test_no_detected_type_leaves_archive_unchanged_for_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            original = archive.read_bytes()
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            processed = []
+            store.control_known_types_only(True)
+            manager = LibraryBacklog(
+                store, lambda *_: processed.append(True),
+                detector=lambda *_: {"page_count": 1, "pages_by_method": {
+                    method: [] for method in ("black_bars", "transparent_black", "white_bars", "mosaic")},
+                    "detected_methods": []},
+            )
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(archive))["state"] != "skipped":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+            self.assertEqual(processed, [])
+            self.assertEqual(archive.read_bytes(), original)
+            progress = store.book_progress(str(archive))
+            self.assertEqual(progress["detected_methods"], [])
+            self.assertEqual(progress["selected_sequence"], [])
+
+    def test_manual_queue_bypasses_automatic_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            store.requeue_book(str(archive), ["black_bars"])
+            store.control_known_types_only(True)
+            calls = []
+
+            def processor(path, sequence, _job):
+                calls.append(sequence)
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(store, processor, detector=lambda *_: self.fail("detector called"))
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(archive))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+            self.assertEqual(calls, [["black_bars"]])
+            self.assertEqual(store.book_progress(str(archive))["auto_detect"], 0)
+
+    def test_detector_failure_pauses_without_treating_book_as_uncensored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            store.control_known_types_only(True)
+            processed = []
+
+            def fail_detection(*_args):
+                raise RuntimeError("model unavailable")
+
+            manager = LibraryBacklog(store, lambda *_: processed.append(True), detector=fail_detection)
+            manager.resume_queue(retry_failed=False)
+            manager._queue_thread.join(timeout=3)
+            progress = store.book_progress(str(archive))
+            self.assertEqual(progress["state"], "failed")
+            self.assertEqual(store.queue_control(), "paused")
+            self.assertIsNone(progress["detected_methods"])
+            self.assertEqual(processed, [])
+
+    def test_saved_detection_is_reused_after_interrupted_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            database = Path(directory) / "state" / "backlog.sqlite3"
+            store = BacklogStore(str(database))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            store.control_known_types_only(True)
+            job = store.claim_job()
+            store.save_detection(job["id"], {
+                "page_count": 1,
+                "pages_by_method": {"black_bars": ["001.jpg"], "transparent_black": [],
+                                    "white_bars": [], "mosaic": []},
+                "detected_methods": ["black_bars"],
+            }, 2.5)
+            restarted = BacklogStore(str(database))
+            calls = []
+
+            def processor(path, sequence, _job):
+                calls.append(sequence)
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(restarted, processor, detector=lambda *_: self.fail("audit repeated"))
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and restarted.book_progress(str(archive))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+            self.assertEqual(calls, [["black_bars"]])
+            self.assertEqual(restarted.book_progress(str(archive))["detected_methods"], ["black_bars"])
+
     def test_elapsed_duration_formatting(self):
         self.assertEqual(format_elapsed_duration(0), "0s")
         self.assertEqual(format_elapsed_duration(377), "6m 17s")

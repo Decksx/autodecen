@@ -1318,8 +1318,26 @@ def _process_backlog_archive(source_path, sequence, job):
     return result
 
 
+def _detect_backlog_censorship(source_path, _job):
+    """Audit all pages without changing the source or loading models in Flask."""
+    root, mosaic_python = validate_aletheia_runtime()
+    script = os.path.join(WORKSPACE_ROOT, "censorship_detection.py")
+    run = subprocess.run(
+        [str(mosaic_python), "-u", script, "--archive", source_path,
+         "--aletheia-root", str(root)],
+        cwd=WORKSPACE_ROOT, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=4 * 3600, check=False,
+    )
+    if run.returncode:
+        raise RuntimeError((run.stderr or run.stdout or "Detector failed").strip()[-2000:])
+    result = json.loads(run.stdout)
+    app.logger.info("Censorship check: %s", ", ".join(result["detected_methods"]) or "no detection")
+    return result
+
+
 library_backlog = LibraryBacklog(
     BacklogStore(BACKLOG_DATABASE), _process_backlog_archive,
+    detector=_detect_backlog_censorship,
     sync_callback=_configured_comic_automation_handoff(),
     prepare_callback=_configured_source_registration(),
     require_source_registration=True,
@@ -1422,6 +1440,21 @@ def control_library_queue(action):
         return jsonify({"success": True, "retried": retried})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+
+@app.route('/api/library-backlog/known-types-only', methods=['POST'])
+def control_library_detection_mode():
+    blocked = _local_backlog_request()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('enabled'), bool):
+        return jsonify({"error": "enabled must be true or false"}), 400
+    try:
+        library_backlog.store.control_known_types_only(data['enabled'])
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify({"success": True, "known_types_only": library_backlog.store.known_types_only()})
 
 
 @app.route('/api/library-backlog/schedule', methods=['POST'])

@@ -112,6 +112,7 @@ export interface LibraryBacklogStatus {
     backup_offload_configured: boolean;
     scan: LibraryScanStatus | null;
     queue_status: 'running' | 'paused' | 'stopped';
+    known_types_only: boolean;
     batch_schedule: {
         enabled: boolean;
         auto_resume: boolean;
@@ -145,6 +146,13 @@ export interface LibraryBookProgress {
     completed_at: string | null;
     duration_seconds: number | null;
     updated_at: string;
+    auto_detect: number;
+    detected_methods: ProcessingType[] | null;
+    detected_pages: Partial<Record<ProcessingType, string[]>> | null;
+    detected_page_counts: Partial<Record<ProcessingType, number>> | null;
+    detection_checked_at: string | null;
+    detection_duration_seconds: number | null;
+    detection_page_count: number | null;
     selected_sequence: ProcessingType[];
     stages: Array<{
         stage: ProcessingType;
@@ -199,6 +207,14 @@ export async function controlLibraryScan(
 
 export async function controlLibraryQueue(action: 'pause' | 'resume' | 'stop'): Promise<void> {
     await backlogRequest(`/queue/${action}`, { method: 'POST' });
+}
+
+export async function controlLibraryDetectionMode(enabled: boolean): Promise<void> {
+    await backlogRequest('/known-types-only', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+    });
 }
 
 export async function controlLibrarySchedule(enabled: boolean): Promise<void> {

@@ -211,6 +211,20 @@ Eligible books run sequentially through `black_bars`, `transparent_black`,
 `white_bars`, and detector-gated Aletheia-Lens `mosaic` restoration using the
 same shared pipeline as manual processing. The source is
 backed up below `camelia-decensor/state/originals` before atomic replacement.
+The backlog also offers an opt-in **Only process books with a detected
+censorship type** mode. Before backup or replacement, Aletheia-Lens checks
+every supported page in each queued CBZ. High-confidence bar detections are
+classified as black, white, or mid-tone/transparent by the median color under
+the detector mask; mosaic detections remain separate. Only detected, still
+pending methods run. An archive with no reliable detection is skipped for
+review, with its bytes and ComicInfo.xml unchanged—not labeled uncensored.
+Detector results, affected page names, count, and elapsed time are saved in
+the backlog database and reused after an interrupted job. A changed archive
+invalidates its prior result. Manually queued methods bypass the automatic
+check. The option is off by default, so an existing queue will retain its
+current behavior until you pause it and enable the checkbox. Detection is a
+conservative filter, not proof that a book is uncensored; review skipped books
+or queue selected methods manually when a detector misses an unusual mask.
 After a completed job, the original is SHA-256-verified into a series-named
 folder on `F:\ai-decensor-originals` and only then removed from C:. Pending
 local originals are retried before the queue claims another book or after a

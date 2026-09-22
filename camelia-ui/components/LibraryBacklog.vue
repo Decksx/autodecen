@@ -62,6 +62,20 @@
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm text-text">
                 <label class="flex items-center gap-2">
+                    <input type="checkbox" :checked="status?.known_types_only ?? false"
+                        :disabled="busy || status?.queue_status === 'running' || (status?.counts.processing ?? 0) > 0"
+                        @change="detectionModeChanged" />
+                    Only process books with a detected censorship type
+                </label>
+                <p class="text-xs text-subtle">
+                    When enabled, Camelia checks every page of each queued CBZ, runs only detected passes,
+                    and leaves books with no reliable detection unchanged for review.
+                    Manually queued methods override this check. Pause the queue to change this option.
+                </p>
+            </div>
+
+            <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm text-text">
+                <label class="flex items-center gap-2">
                     <input type="checkbox" :checked="status?.batch_schedule?.enabled ?? false"
                         :disabled="busy || !status?.comic_automation_handoff_configured || !status?.source_registration_configured || !status?.backup_offload_configured"
                         @change="scheduleChanged" />
@@ -126,6 +140,17 @@
                             <template v-if="book.duration_seconds !== null"> · total {{ formatDuration(book.duration_seconds) }}</template>
                         </span>
                     </div>
+                    <div v-if="book.detection_checked_at" class="text-xs text-foam">
+                        Censorship check: {{ book.detected_methods?.length
+                            ? book.detected_methods.map(stageLabel).join(', ')
+                            : 'No reliable type detected — archive unchanged' }}
+                        <span v-if="book.detection_page_count !== null"> · {{ book.detection_page_count }} pages checked</span>
+                        <span v-if="book.detection_duration_seconds !== null"> · {{ formatDuration(book.detection_duration_seconds) }}</span>
+                        <span> · {{ formatLocalTimestamp(book.detection_checked_at) }}</span>
+                        <div v-if="book.detected_methods?.length" class="text-subtle">
+                            {{ book.detected_methods.map(method => `${stageLabel(method)}: ${book.detected_page_counts?.[method] ?? 0} page(s)`).join(' · ') }}
+                        </div>
+                    </div>
                     <div class="grid grid-cols-2 lg:grid-cols-4 gap-2">
                         <div v-for="stage in book.stages" :key="stage.stage" class="rounded border border-overlay px-2 py-1 text-xs"
                             :class="{ 'text-foam border-foam': stage.state === 'completed', 'text-love border-love': stage.state === 'failed', 'text-gold border-gold': stage.state === 'running' || stage.state === 'passed' }">
@@ -146,7 +171,7 @@
                             <template v-if="phase.duration_seconds !== null"> · {{ formatDuration(phase.duration_seconds) }}</template>
                         </div>
                     </div>
-                    <p v-if="book.last_error" class="text-xs text-love break-all">{{ book.last_error }}</p>
+                    <p v-if="book.last_error" class="text-xs break-all" :class="book.state === 'skipped' ? 'text-subtle' : 'text-love'">{{ book.last_error }}</p>
                 </div>
             </div>
 
@@ -163,6 +188,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
+    controlLibraryDetectionMode,
     controlLibraryQueue,
     controlLibrarySchedule,
     controlLibraryScan,
@@ -246,6 +272,13 @@ function scanAction(action: 'pause' | 'stop'): void {
 
 function queueAction(action: 'pause' | 'resume' | 'stop'): void {
     void run(() => controlLibraryQueue(action));
+}
+
+function detectionModeChanged(event: Event): void {
+    const checkbox = event.target as HTMLInputElement;
+    void run(() => controlLibraryDetectionMode(checkbox.checked)).finally(() => {
+        checkbox.checked = status.value?.known_types_only ?? false;
+    });
 }
 
 function scheduleChanged(event: Event): void {

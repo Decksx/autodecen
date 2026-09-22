@@ -380,6 +380,12 @@ class BacklogStore:
                     metadata_tags TEXT,
                     eligibility_reason TEXT,
                     eligibility_version INTEGER NOT NULL DEFAULT 1,
+                    auto_detect INTEGER NOT NULL DEFAULT 1,
+                    detected_methods TEXT,
+                    detected_pages TEXT,
+                    detection_checked_at TEXT,
+                    detection_duration_seconds REAL,
+                    detection_page_count INTEGER,
                     state TEXT NOT NULL,
                     selected_sequence TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -441,6 +447,16 @@ class BacklogStore:
                 db.execute("ALTER TABLE books ADD COLUMN eligibility_version INTEGER NOT NULL DEFAULT 1")
             if "duration_seconds" not in columns:
                 db.execute("ALTER TABLE books ADD COLUMN duration_seconds REAL")
+            for name, definition in (
+                ("auto_detect", "INTEGER NOT NULL DEFAULT 1"),
+                ("detected_methods", "TEXT"),
+                ("detected_pages", "TEXT"),
+                ("detection_checked_at", "TEXT"),
+                ("detection_duration_seconds", "REAL"),
+                ("detection_page_count", "INTEGER"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE books ADD COLUMN {name} {definition}")
             stage_columns = {row["name"] for row in db.execute("PRAGMA table_info(book_stages)")}
             if "duration_seconds" not in stage_columns:
                 db.execute("ALTER TABLE book_stages ADD COLUMN duration_seconds REAL")
@@ -450,6 +466,10 @@ class BacklogStore:
             )
             db.execute(
                 "INSERT OR IGNORE INTO controls(name, value, updated_at) VALUES('batch_schedule', 'disabled', ?)",
+                (utc_now(),),
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO controls(name, value, updated_at) VALUES('known_types_only', 'disabled', ?)",
                 (utc_now(),),
             )
             db.execute(
@@ -633,7 +653,10 @@ class BacklogStore:
                     """UPDATE books SET root_path=?, last_scan_id=?, file_size=?, mtime_ns=?,
                        metadata_title=?, metadata_tags=?, eligibility_reason=?, state=?,
                        selected_sequence=?, attempts=0, current_stage=NULL, queued_at=?,
-                       last_error=?, completed_at=NULL, updated_at=?, eligibility_version=2 WHERE source_path=?""",
+                       last_error=?, completed_at=NULL, updated_at=?, eligibility_version=2,
+                       auto_detect=1, detected_methods=NULL, detected_pages=NULL,
+                       detection_checked_at=NULL, detection_duration_seconds=NULL,
+                       detection_page_count=NULL WHERE source_path=?""",
                     values,
                 )
                 book_id = prior["id"]
@@ -687,6 +710,22 @@ class BacklogStore:
     def queue_control(self) -> str:
         with self.connect() as db:
             return db.execute("SELECT value FROM controls WHERE name='queue'").fetchone()["value"]
+
+    def known_types_only(self) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM controls WHERE name='known_types_only'").fetchone()
+            return bool(row and row["value"] == "enabled")
+
+    def control_known_types_only(self, enabled: bool) -> None:
+        with self.connect() as db:
+            if db.execute("SELECT 1 FROM books WHERE state='processing' LIMIT 1").fetchone():
+                raise ValueError("Wait for the current book to finish before changing censorship check mode")
+            if db.execute("SELECT value FROM controls WHERE name='queue'").fetchone()["value"] == "running":
+                raise ValueError("Pause the queue before changing censorship check mode")
+            db.execute("UPDATE controls SET value=?, updated_at=? WHERE name='known_types_only'",
+                       ("enabled" if enabled else "disabled", utc_now()))
+            self._event(db, "censorship_check_enabled" if enabled else "censorship_check_disabled",
+                        "Known-censorship-types-only queue mode " + ("enabled" if enabled else "disabled"))
 
     def schedule_enabled(self) -> bool:
         with self.connect() as db:
@@ -955,6 +994,61 @@ class BacklogStore:
             )
             self._event(db, "job_skipped", reason, book_id=book_id)
 
+    def mark_detection_started(self, book_id: int) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE books SET current_stage='detecting', updated_at=? WHERE id=? AND state='processing'",
+                (utc_now(), book_id),
+            )
+            self._event(db, "censorship_check_start", "Checking page censorship types", book_id=book_id)
+
+    def save_detection(self, book_id: int, result: dict, duration_seconds: float) -> None:
+        """Save a complete audit; never interpret a detector error as no censorship."""
+        methods = result["detected_methods"]
+        pages = result["pages_by_method"]
+        count = result["page_count"]
+        if (not isinstance(methods, list) or not isinstance(pages, dict)
+                or not isinstance(count, int) or count <= 0
+                or set(pages) != set(DEFAULT_SEQUENCE)
+                or any(not isinstance(names, list) or len(names) > count
+                       or any(not isinstance(name, str) for name in names)
+                       for names in pages.values())
+                or methods != [method for method in DEFAULT_SEQUENCE if pages[method]]):
+            raise ValueError("Detector returned an invalid page audit")
+        now = utc_now()
+        with self.connect() as db:
+            book = db.execute("SELECT state FROM books WHERE id=?", (book_id,)).fetchone()
+            if book is None or book["state"] != "processing":
+                raise ValueError("Detection can only be saved for the processing book")
+            db.execute(
+                """UPDATE books SET detected_methods=?, detected_pages=?,
+                   detection_checked_at=?, detection_duration_seconds=?,
+                   detection_page_count=?, current_stage=NULL, updated_at=? WHERE id=?""",
+                (json.dumps(methods), json.dumps(pages), now, duration_seconds,
+                 count, now, book_id),
+            )
+            self._event(db, "censorship_detected",
+                        f"Inspected {count} page(s): {', '.join(methods) if methods else 'no reliable detection'} "
+                        f"({format_elapsed_duration(duration_seconds)})", book_id=book_id)
+
+    def select_detected_methods(self, book_id: int, methods: Iterable[str]) -> list[str]:
+        """Narrow the automatic plan without adding methods absent from the queue."""
+        with self.connect() as db:
+            book = db.execute("SELECT selected_sequence,state FROM books WHERE id=?", (book_id,)).fetchone()
+            if book is None or book["state"] != "processing":
+                raise ValueError("Only a processing book can have its pass plan narrowed")
+            detected = set(methods)
+            selected = [method for method in json.loads(book["selected_sequence"]) if method in detected]
+            db.execute("UPDATE books SET selected_sequence=?, updated_at=? WHERE id=?",
+                       (json.dumps(selected), utc_now(), book_id))
+            for stage in DEFAULT_SEQUENCE:
+                if stage not in selected:
+                    db.execute("DELETE FROM book_stages WHERE book_id=? AND stage=? AND state='pending'",
+                               (book_id, stage))
+            self._event(db, "censorship_plan", f"Selected detected passes: {', '.join(selected) or 'none'}",
+                        book_id=book_id)
+            return selected
+
     def retry_failed(self) -> int:
         with self.connect() as db:
             cursor = db.execute(
@@ -997,7 +1091,9 @@ class BacklogStore:
                 """UPDATE books SET state='queued', selected_sequence=?, attempts=0,
                    queued_at=?, started_at=NULL, completed_at=NULL, current_stage=NULL,
                    duration_seconds=NULL, last_error=NULL, output_path=NULL,
-                   file_size=?, mtime_ns=?, updated_at=?
+                   file_size=?, mtime_ns=?, updated_at=?, auto_detect=0,
+                   detected_methods=NULL, detected_pages=NULL, detection_checked_at=NULL,
+                   detection_duration_seconds=NULL, detection_page_count=NULL
                    WHERE id=?""",
                 (json.dumps(sequence), now, stat.st_size, stat.st_mtime_ns, now, row["id"]),
             )
@@ -1018,7 +1114,8 @@ class BacklogStore:
         return sequence
 
     @staticmethod
-    def _progress_rows(db: sqlite3.Connection, books: list[sqlite3.Row]) -> list[dict]:
+    def _progress_rows(db: sqlite3.Connection, books: list[sqlite3.Row],
+                       *, include_detected_pages: bool = False) -> list[dict]:
         if not books:
             return []
         ids = [book["id"] for book in books]
@@ -1036,7 +1133,16 @@ class BacklogStore:
             item = {key: book[key] for key in (
                 "id", "source_path", "state", "attempts", "current_stage",
                 "last_error", "started_at", "completed_at", "duration_seconds", "updated_at",
+                "auto_detect", "detected_methods", "detected_pages", "detection_checked_at",
+                "detection_duration_seconds", "detection_page_count",
             )}
+            item["detected_methods"] = json.loads(item["detected_methods"]) if item["detected_methods"] else None
+            detected_pages = json.loads(item["detected_pages"]) if item["detected_pages"] else None
+            item["detected_page_counts"] = (
+                {method: len(names) for method, names in detected_pages.items()}
+                if detected_pages is not None else None
+            )
+            item["detected_pages"] = detected_pages if include_detected_pages else None
             item["selected_sequence"] = selected
             item["stages"] = [
                 {
@@ -1068,7 +1174,7 @@ class BacklogStore:
             row = db.execute(
                 "SELECT * FROM books WHERE source_path=? COLLATE NOCASE", (os.path.abspath(source_path),)
             ).fetchone()
-            return self._progress_rows(db, [row])[0] if row else None
+            return self._progress_rows(db, [row], include_detected_pages=True)[0] if row else None
 
     def snapshot(self, event_limit: int = 100) -> dict:
         with self.connect() as db:
@@ -1077,6 +1183,7 @@ class BacklogStore:
             current = db.execute("SELECT source_path,current_stage FROM books WHERE state='processing' ORDER BY started_at LIMIT 1").fetchone()
             recent = db.execute(
                 """SELECT * FROM books WHERE state IN ('processing','completed','failed')
+                   OR (state='skipped' AND detection_checked_at IS NOT NULL)
                    ORDER BY CASE state WHEN 'processing' THEN 0 ELSE 1 END,
                             updated_at DESC, id DESC LIMIT 12"""
             ).fetchall()
@@ -1085,6 +1192,7 @@ class BacklogStore:
                 "allowed_roots": list(DEFAULT_ROOTS),
                 "scan": dict(scan) if scan else None,
                 "queue_status": self.queue_control(),
+                "known_types_only": self.known_types_only(),
                 "batch_schedule": {
                     "enabled": self.schedule_enabled(),
                     "auto_resume": self.scheduled_autostart(),
@@ -1110,7 +1218,8 @@ class LibraryBacklog:
                  backup_callback: Callable[[dict | None, dict | None], object] | None = None,
                  require_backup_offload: bool = False,
                  prepare_callback: Callable[[dict], object] | None = None,
-                 require_source_registration: bool = False):
+                 require_source_registration: bool = False,
+                 detector: Callable[[str, dict], dict] | None = None):
         self.store = store
         self.processor = processor
         self.sync_callback = sync_callback
@@ -1118,6 +1227,7 @@ class LibraryBacklog:
         self.require_backup_offload = require_backup_offload
         self.prepare_callback = prepare_callback
         self.require_source_registration = require_source_registration
+        self.detector = detector
         self._scan_threads: dict[int, threading.Thread] = {}
         self._queue_thread: threading.Thread | None = None
         self._thread_lock = threading.Lock()
@@ -1214,6 +1324,8 @@ class LibraryBacklog:
             self.store.finish_directory(scan_id, directory, children, error=error)
 
     def resume_queue(self, retry_failed=True) -> int:
+        if self.store.known_types_only() and self.detector is None:
+            raise ValueError("Known-types-only queue mode requires a censorship detector")
         if self.require_backup_offload and self.backup_callback is None:
             raise ValueError("Backlog processing requires verified F: backup offload configuration")
         if (self.require_source_registration and self.prepare_callback is None
@@ -1346,6 +1458,33 @@ class LibraryBacklog:
                 self.store.fail_job(book_id, f"Source preflight failed: {exc}")
                 self.pause_queue()
                 return
+            if self.store.known_types_only() and job["auto_detect"]:
+                try:
+                    if job["detected_methods"] is None:
+                        self.store.mark_detection_started(book_id)
+                        detection_started = time.perf_counter()
+                        detection = self.detector(job["source_path"], job)
+                        current = os.stat(job["source_path"])
+                        if (current.st_size, current.st_mtime_ns) != (job["file_size"], job["mtime_ns"]):
+                            raise RuntimeError("Source changed during censorship check")
+                        self.store.save_detection(
+                            book_id, detection, time.perf_counter() - detection_started
+                        )
+                        detected_methods = detection["detected_methods"]
+                    else:
+                        detected_methods = json.loads(job["detected_methods"])
+                    sequence = self.store.select_detected_methods(book_id, detected_methods)
+                    if not sequence:
+                        self.store.skip_job(
+                            book_id,
+                            "No queued censorship type was detected; archive left unchanged for review",
+                        )
+                        continue
+                except Exception as exc:
+                    LOGGER.exception("Censorship check failed for %s", job["source_path"])
+                    self.store.fail_job(book_id, f"Censorship check failed: {type(exc).__name__}: {exc}")
+                    self.pause_queue()
+                    return
             if self.backup_callback is not None:
                 try:
                     self.backup_callback(job, None)
