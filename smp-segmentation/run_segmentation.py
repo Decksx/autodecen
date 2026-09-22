@@ -1,4 +1,5 @@
 import os
+import io
 import cv2
 import torch
 import numpy as np
@@ -6,17 +7,18 @@ import argparse
 import segmentation_models_pytorch as smp
 from albumentations import Compose, Normalize, Resize
 from albumentations.pytorch import ToTensorV2
-from PIL import Image
+from PIL import Image, ImageCms
 import tempfile
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMAGE_SIZE = 1024
 DEFAULT_OUTPUT_DIR = "output/"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATHS = {
-    "black_bars": "pretrained/best_black_bars_model.pth",
-    "white_bars": "pretrained/best_white_bars_model.pth",
-    "transparent_black": "pretrained/best_transparent_black_model.pth"
+    "black_bars": os.path.join(SCRIPT_DIR, "pretrained", "best_black_bars_model.pth"),
+    "white_bars": os.path.join(SCRIPT_DIR, "pretrained", "best_white_bars_model.pth"),
+    "transparent_black": os.path.join(SCRIPT_DIR, "pretrained", "best_transparent_black_model.pth")
 }
 
 preprocess_pipeline = Compose([
@@ -31,6 +33,9 @@ def get_input_dir(model_type, base_input_dir="input"):
 
 def load_model(model_path):
     """Load the trained model from the specified path."""
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Segmentation model not found: {model_path}")
+    print(f"Loading segmentation model: {model_path}", flush=True)
     checkpoint = torch.load(model_path, map_location=DEVICE)
     if "model_state_dict" in checkpoint:
         model_state_dict = checkpoint["model_state_dict"]
@@ -121,66 +126,99 @@ def convert_to_png(image_path):
     if ext == '.png':
         return image_path, False
     
+    temp_path = None
+    display_path = image_path
     try:
         workspace_root = os.environ.get('WORKSPACE_ROOT', '')
-        display_path = image_path
         if workspace_root and image_path.startswith(workspace_root):
             display_path = image_path[len(workspace_root):].lstrip(os.sep)
         
         print(f"Converting {ext} image to PNG: {display_path}")
-        img = Image.open(image_path)
-        
-        fd, temp_path = tempfile.mkstemp(suffix='.png')
-        os.close(fd)
-        
-        img.save(temp_path, format='PNG')
+        with Image.open(image_path) as img:
+            if img.mode == 'CMYK':
+                if img.info.get('icc_profile'):
+                    source_profile = ImageCms.ImageCmsProfile(io.BytesIO(img.info['icc_profile']))
+                    img = ImageCms.profileToProfile(
+                        img, source_profile, ImageCms.createProfile('sRGB'), outputMode='RGB'
+                    )
+                else:
+                    img = img.convert('RGB')
+            elif img.mode not in {'RGB', 'RGBA', 'L', 'LA', 'P', '1', 'I'}:
+                img = img.convert('RGB')
+
+            fd, temp_path = tempfile.mkstemp(suffix='.png')
+            os.close(fd)
+            img.save(temp_path, format='PNG')
         return temp_path, True
     except Exception as e:
-        print(f"Error converting image {display_path}: {e}")
-        return image_path, False
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise RuntimeError(
+            f"Could not convert {display_path} ({type(e).__name__}: {e})"
+        ) from e
 
 def process_directory_recursively(input_dir, output_dir, model):
     temp_files = []
-    
     workspace_root = os.environ.get('WORKSPACE_ROOT', '')
-    
+    image_paths = []
+    for root, _, files in os.walk(input_dir):
+        for file in sorted(files):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif')):
+                image_paths.append(os.path.join(root, file))
+    print(
+        f"Segmentation found {len(image_paths)} supported image(s) in {input_dir}",
+        flush=True,
+    )
+    failures = []
     try:
-        for root, _, files in os.walk(input_dir):
+        for index, image_path in enumerate(image_paths, start=1):
+            root = os.path.dirname(image_path)
+            file = os.path.basename(image_path)
             relative_path = os.path.relpath(root, input_dir)
             output_subdir = os.path.join(output_dir, relative_path)
             os.makedirs(output_subdir, exist_ok=True)
-
-            for file in files:
-                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                    image_path = os.path.join(root, file)
-                    try:
-                        # Convert to PNG if needed
-                        png_path, is_temp = convert_to_png(image_path)
-                        if is_temp:
-                            temp_files.append(png_path)
-                        
-                        display_path = image_path
-                        if workspace_root and image_path.startswith(workspace_root):
-                            display_path = image_path[len(workspace_root):].lstrip(os.sep)
-                        
-                        print(f"Processing: {display_path}")
-                        original_image, tensor_image = preprocess_image(png_path)
-                        predicted_mask = predict_mask(model, tensor_image)
-
-                        opacity_mask = create_opacity_mask(predicted_mask)
-
-                        output_filename = os.path.splitext(file)[0] + '.png'
-                        save_results(original_image, opacity_mask, output_dir, 
-                                    os.path.join(relative_path, output_filename))
-                    except Exception as e:
-                        print(f"Error processing {display_path}: {e}")
+            display_path = image_path
+            if workspace_root and image_path.startswith(workspace_root):
+                display_path = image_path[len(workspace_root):].lstrip(os.sep)
+            try:
+                png_path, is_temp = convert_to_png(image_path)
+                if is_temp:
+                    temp_files.append(png_path)
+                if index == 1 or index == len(image_paths) or index % 25 == 0:
+                    print(
+                        f"Segmentation progress {index}/{len(image_paths)}: {display_path}",
+                        flush=True,
+                    )
+                original_image, tensor_image = preprocess_image(png_path)
+                predicted_mask = predict_mask(model, tensor_image)
+                opacity_mask = create_opacity_mask(predicted_mask)
+                output_filename = os.path.splitext(file)[0] + '.png'
+                save_results(
+                    original_image,
+                    opacity_mask,
+                    output_dir,
+                    os.path.join(relative_path, output_filename),
+                )
+            except Exception as e:
+                failures.append((display_path, e))
+                print(
+                    f"Image failed: {display_path} ({type(e).__name__}: {e})",
+                    flush=True,
+                )
     finally:
         # Clean up any temporary files
         for temp_file in temp_files:
             try:
                 os.remove(temp_file)
-            except:
-                pass
+            except OSError as exc:
+                print(f"Temporary-file cleanup warning: {temp_file}: {exc}", flush=True)
+    if failures:
+        failed_paths = ', '.join(path for path, _ in failures[:5])
+        raise RuntimeError(
+            f"Segmentation failed for {len(failures)} of {len(image_paths)} image(s): "
+            f"{failed_paths}"
+        )
+    return len(image_paths)
 
 def run_inference(model_path, model_type, base_input_dir, output_dir):
     """Run inference on all images in the input directory."""
@@ -195,7 +233,8 @@ def run_inference(model_path, model_type, base_input_dir, output_dir):
         print(f"Please place input images in {input_dir}")
         return
 
-    process_directory_recursively(input_dir, output_dir, model)
+    processed_count = process_directory_recursively(input_dir, output_dir, model)
+    print(f"Segmentation completed for {processed_count} image(s)", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run segmentation inference.")

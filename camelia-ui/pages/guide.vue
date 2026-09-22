@@ -11,7 +11,7 @@ const cliInstructions = [
         title: 'Run the Command',
         content: 'Execute the main script with your selected model type',
         code: 'python main.py --model_type [model_type]',
-        options: ['black_bars', 'white_bars', 'transparent_black'],
+        options: ['black_bars', 'white_bars', 'transparent_black', 'mosaic'],
         icon: 'lucide:terminal'
     },
     {
@@ -46,7 +46,7 @@ const webInstructions = [
 const features = [
     {
         title: 'Multiple Censorship Types',
-        description: 'Support for black bars, white bars, and transparent censoring',
+        description: 'Support for black bars, white bars, transparent bars, and mosaics',
         icon: 'lucide:layers'
     },
     {

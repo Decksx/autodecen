@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.third_party/
+camelia-ui/.nuxt/
+camelia-ui/.output/
+camelia-decensor/state/*.sqlite3*
+camelia-decensor/state/originals/
+camelia-decensor/state/benchmarks/

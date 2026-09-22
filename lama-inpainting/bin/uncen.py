@@ -32,6 +32,26 @@ import torch.nn.functional as F
 from saicinpainting.training.data.masks import get_mask_generator
 
 
+def pad_crop_context(tensor, pad):
+    """Pad crop context without violating PyTorch reflection constraints.
+
+    ReflectionPad requires every pad amount to be smaller than the source
+    dimension.  Comic pages can be much shorter or narrower than the mask-
+    derived crop radius, so preserve reflection independently on dimensions
+    where it is valid and use edge replication only on the constrained axis.
+    """
+    if pad < 0:
+        raise ValueError("Padding must be non-negative")
+    if pad == 0:
+        return tensor
+
+    height, width = tensor.shape[-2:]
+    horizontal_mode = 'reflect' if width > 1 and pad < width else 'replicate'
+    padded = F.pad(tensor, (pad, pad, 0, 0), mode=horizontal_mode)
+    vertical_mode = 'reflect' if height > 1 and pad < height else 'replicate'
+    return F.pad(padded, (0, 0, pad, pad), mode=vertical_mode)
+
+
 
 def init_inpaint_model(model_path):
 
@@ -110,10 +130,14 @@ def inpaint(model, image_orig, mask_orig):
         #h, w = rey - rsy, rex - rsx
         pad = pp + 1
 
-        region = F.pad(torch.from_numpy(image).unsqueeze(0), (pad,pad,pad,pad), mode='reflect')[:, :, pad+rsy:pad+rey, pad+rsx:pad+rex].numpy()[0]
+        region = pad_crop_context(
+            torch.from_numpy(image).unsqueeze(0), pad
+        )[:, :, pad+rsy:pad+rey, pad+rsx:pad+rex].numpy()[0]
 
 
-        region_mask = F.pad(torch.from_numpy(mask).unsqueeze(0), (pad,pad,pad,pad), mode='reflect')[:, :, pad+rsy:pad+rey, pad+rsx:pad+rex].numpy()[0]
+        region_mask = pad_crop_context(
+            torch.from_numpy(mask).unsqueeze(0), pad
+        )[:, :, pad+rsy:pad+rey, pad+rsx:pad+rex].numpy()[0]
 
         batch_o = [dict(
                 image=region,
@@ -147,8 +171,19 @@ def inpaint(model, image_orig, mask_orig):
 
 def process_directory_recursively(input_dir, mask_dir, output_dir, debug_dir, model):
     workspace_root = os.environ.get('WORKSPACE_ROOT', '')
-    
+    input_files = []
     for root, _, files in os.walk(input_dir):
+        input_files.extend(
+            os.path.join(root, file)
+            for file in sorted(files)
+            if file.lower().endswith('.png')
+        )
+    print(f"Inpainting found {len(input_files)} image(s) in {input_dir}", flush=True)
+    failures = []
+
+    for index, in_file in enumerate(input_files, start=1):
+        root = os.path.dirname(in_file)
+        file = os.path.basename(in_file)
         relative_path = os.path.relpath(root, input_dir)
         output_subdir = os.path.join(output_dir, relative_path)
         debug_subdir = os.path.join(debug_dir, relative_path) if debug_dir else None
@@ -157,58 +192,66 @@ def process_directory_recursively(input_dir, mask_dir, output_dir, debug_dir, mo
         if debug_subdir:
             os.makedirs(debug_subdir, exist_ok=True)
 
-        for file in files:
-            # Support both original and PNG extensions
-            if file.lower().endswith('.png'):
-                in_file = os.path.join(root, file)
-                mask_file = os.path.join(mask_dir, relative_path, file)
+        mask_file = os.path.join(mask_dir, relative_path, file)
 
-                if not os.path.exists(mask_file):
-                    print(f"Mask file not found for {file}, checking for mask with different extension...")
-                    base_name = os.path.splitext(file)[0]
-                    mask_found = False
-                    
-                    for ext in ['.png', '.jpg', '.jpeg', '.webp']:
-                        potential_mask = os.path.join(mask_dir, relative_path, base_name + ext)
-                        if os.path.exists(potential_mask):
-                            mask_file = potential_mask
-                            mask_found = True
-                            print(f"Found matching mask: {os.path.basename(mask_file)}")
-                            break
-                            
-                    if not mask_found:
-                        print(f"No mask file found for {file}, skipping.")
-                        continue
+        if not os.path.exists(mask_file):
+            base_name = os.path.splitext(file)[0]
+            mask_file = next(
+                (
+                    candidate
+                    for ext in ['.png', '.jpg', '.jpeg', '.webp']
+                    for candidate in [os.path.join(mask_dir, relative_path, base_name + ext)]
+                    if os.path.exists(candidate)
+                ),
+                None,
+            )
+            if mask_file is None:
+                failures.append((in_file, 'matching mask not found'))
+                print(f"Inpainting failed: {in_file} (matching mask not found)", flush=True)
+                continue
 
-                display_path = in_file
-                if workspace_root and in_file.startswith(workspace_root):
-                    display_path = in_file[len(workspace_root):].lstrip(os.sep)
-                    
-                print(f"Processing: {display_path}")
+        display_path = in_file
+        if workspace_root and in_file.startswith(workspace_root):
+            display_path = in_file[len(workspace_root):].lstrip(os.sep)
+        if index == 1 or index == len(input_files) or index % 25 == 0:
+            print(
+                f"Inpainting progress {index}/{len(input_files)}: {display_path}",
+                flush=True,
+            )
 
-                try:
-                    img = cv2.cvtColor(cv2.imread(in_file), cv2.COLOR_BGR2RGB)
-                    mask = cv2.imread(mask_file)
-                    
-                    if img is None:
-                        print(f"Error: Could not read image file {os.path.basename(in_file)}")
-                        continue
-                        
-                    if mask is None:
-                        print(f"Error: Could not read mask file {os.path.basename(mask_file)}")
-                        continue
+        try:
+            raw_image = cv2.imread(in_file)
+            mask = cv2.imread(mask_file)
+            if raw_image is None:
+                raise ValueError('image could not be read')
+            if mask is None:
+                raise ValueError(f'mask could not be read: {mask_file}')
+            img = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB)
 
-                    output, dbg = inpaint(model, img, mask)
+            output, dbg = inpaint(model, img, mask)
 
-                    out_path = os.path.join(output_subdir, file)
-                    cv2.imwrite(out_path, cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
+            out_path = os.path.join(output_subdir, file)
+            if not cv2.imwrite(out_path, cv2.cvtColor(output, cv2.COLOR_BGR2RGB)):
+                raise OSError(f'could not write output: {out_path}')
 
-                    if debug_subdir:
-                        dbg_path = os.path.join(debug_subdir, file)
-                        cv2.imwrite(dbg_path, cv2.cvtColor(dbg, cv2.COLOR_BGR2RGB))
-                except Exception as e:
-                    print(f"Error processing {os.path.basename(in_file)}: {str(e)}")
-                    continue
+            if debug_subdir:
+                dbg_path = os.path.join(debug_subdir, file)
+                if not cv2.imwrite(dbg_path, cv2.cvtColor(dbg, cv2.COLOR_BGR2RGB)):
+                    raise OSError(f'could not write debug output: {dbg_path}')
+        except Exception as exc:
+            failures.append((in_file, f'{type(exc).__name__}: {exc}'))
+            print(
+                f"Inpainting failed: {display_path} ({type(exc).__name__}: {exc})",
+                flush=True,
+            )
+
+    if failures:
+        failed_paths = ', '.join(path for path, _ in failures[:5])
+        raise RuntimeError(
+            f"Inpainting failed for {len(failures)} of {len(input_files)} image(s): "
+            f"{failed_paths}"
+        )
+    return len(input_files)
 
 
 def main():
@@ -230,7 +273,10 @@ def main():
     if args.debug_dir and not os.path.exists(args.debug_dir):
         os.makedirs(args.debug_dir)
 
-    process_directory_recursively(args.in_dir, args.mask_dir, args.out_dir, args.debug_dir, model)
+    processed_count = process_directory_recursively(
+        args.in_dir, args.mask_dir, args.out_dir, args.debug_dir, model
+    )
+    print(f"Inpainting completed for {processed_count} image(s)", flush=True)
 
 
 if __name__ == '__main__':

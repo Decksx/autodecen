@@ -9,39 +9,50 @@
             <div class="space-y-6" v-auto-animate>
                 <!-- Processing Type Option -->
                 <div class="option-group">
-                    <label class="block text-foam text-sm mb-3">Processing Type</label>
+                    <div class="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                            <label class="block text-foam text-sm">Processing sequence</label>
+                            <p class="mt-1 text-xs text-subtle">Selected passes run in the order shown.</p>
+                        </div>
+                        <button
+                            type="button"
+                            class="text-xs text-iris hover:text-foam"
+                            @click="selectAll">
+                            Select all
+                        </button>
+                    </div>
 
-                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3" v-auto-animate>
-                        <!-- Radio option cards -->
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3" v-auto-animate>
+                        <!-- Ordered multi-select option cards -->
                         <label
                             v-for="option in processingOptions"
                             :key="option.value"
                             class="relative cursor-pointer rounded-md border border-overlay p-4 hover:border-iris transition-colors"
                             :class="{
-                                'border-iris bg-highlight-low': localProcessingType === option.value
+                                'border-iris bg-highlight-low': localProcessingTypes.includes(option.value)
                             }">
                             <input
-                                type="radio"
+                                type="checkbox"
                                 :value="option.value"
-                                v-model="localProcessingType"
+                                v-model="localProcessingTypes"
                                 class="absolute h-0 w-0 opacity-0" />
                             <div class="flex items-center">
                                 <div class="flex-shrink-0">
                                     <div
                                         class="h-5 w-5 rounded-full border flex items-center justify-center border-subtle"
                                         :class="{
-                                            'border-iris': localProcessingType === option.value
+                                            'border-iris': localProcessingTypes.includes(option.value)
                                         }">
                                         <div
-                                            v-if="localProcessingType === option.value"
-                                            class="h-3 w-3 rounded-full bg-iris"></div>
+                                            v-if="localProcessingTypes.includes(option.value)"
+                                            class="h-3 w-3 rounded-sm bg-iris"></div>
                                     </div>
                                 </div>
                                 <div class="ml-3">
                                     <span
                                         class="block text-sm"
                                         :class="
-                                            localProcessingType === option.value
+                                            localProcessingTypes.includes(option.value)
                                                 ? 'text-foam'
                                                 : 'text-text'
                                         ">
@@ -55,6 +66,11 @@
                         </label>
                     </div>
                 </div>
+
+                <label class="flex items-center gap-2 text-sm text-text">
+                    <input type="checkbox" :checked="reprocess" @change="emit('update:reprocess', ($event.target as HTMLInputElement).checked)" />
+                    Reprocess selected methods even if already recorded in ComicInfo.xml
+                </label>
 
                 <!-- Process/Cancel Button -->
                 <div class="pt-4 flex justify-end">
@@ -72,7 +88,7 @@
                         <div class="flex items-center space-x-2">
                             <Icon v-if="isProcessing" name="lucide:x" class="w-4 h-4" />
                             <Icon v-else name="lucide:play" />
-                            <span>{{ isProcessing ? 'Cancel' : 'Process Images' }}</span>
+                            <span>{{ isProcessing ? 'Cancel' : 'Process Selection' }}</span>
                         </div>
                     </button>
                 </div>
@@ -84,7 +100,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue';
 
-type ProcessingType = 'black_bars' | 'white_bars' | 'transparent_black';
+type ProcessingType = 'black_bars' | 'white_bars' | 'transparent_black' | 'mosaic';
 
 interface ProcessingOption {
     value: ProcessingType;
@@ -99,41 +115,63 @@ const processingOptions: ProcessingOption[] = [
         description: 'Decensor black censoring bars'
     },
     {
+        value: 'transparent_black',
+        label: 'Transparent Black',
+        description: 'Decensor semi-transparent censoring bars'
+    },
+    {
         value: 'white_bars',
         label: 'White Bars',
         description: 'Decensor white censoring bars'
     },
     {
-        value: 'transparent_black',
-        label: 'Transparent Black',
-        description: 'Decensor semi-transparent censoring bars'
+        value: 'mosaic',
+        label: 'Mosaic',
+        description: 'Detect and reconstruct mosaic censorship with Aletheia-Lens'
     }
 ];
 
 const props = defineProps<{
-    processingType: ProcessingType;
+    processingTypes: ProcessingType[];
     canProcess: boolean;
     isProcessing: boolean;
+    reprocess: boolean;
 }>();
 
 const emit = defineEmits<{
-    (e: 'update:processingType', type: ProcessingType): void;
+    (e: 'update:processingTypes', types: ProcessingType[]): void;
+    (e: 'update:reprocess', value: boolean): void;
     (e: 'process'): void;
     (e: 'cancel'): void;
 }>();
 
-const localProcessingType = ref<ProcessingType>(props.processingType);
-
-watch(localProcessingType, (newValue) => {
-    emit('update:processingType', newValue);
-});
+const localProcessingTypes = ref<ProcessingType[]>([...props.processingTypes]);
 
 watch(
-    () => props.processingType,
+    localProcessingTypes,
     (newValue) => {
-        localProcessingType.value = newValue;
-    }
+        const selected = new Set(newValue);
+        emit(
+            'update:processingTypes',
+            processingOptions
+                .map((option) => option.value)
+                .filter((value) => selected.has(value))
+        );
+    },
+    { deep: true }
 );
+
+watch(
+    () => props.processingTypes,
+    (newValue) => {
+        localProcessingTypes.value = [...newValue];
+    },
+    { deep: true }
+);
+
+function selectAll(): void {
+    localProcessingTypes.value = processingOptions.map((option) => option.value);
+}
 
 function handleButtonClick() {
     if (props.isProcessing) {

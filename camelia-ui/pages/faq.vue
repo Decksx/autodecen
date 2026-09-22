@@ -12,7 +12,7 @@ interface FaqItem {
 const faqItems = ref<FaqItem[]>([
     {
         question: 'What is Camelia?',
-        answer: 'Camelia is an image decensor tool to remove censorship bars from images (you know what kind of images I am talking about). It supports black bars, white bars, and transparent black censorship types.',
+        answer: 'Camelia is an image decensor tool for black bars, white bars, transparent black bars, and mosaic censorship. Mosaic restoration uses the separately installed Aletheia-Lens backend.',
         isOpen: false,
         category: 'general',
         icon: 'lucide:info'
@@ -54,8 +54,8 @@ const faqItems = ref<FaqItem[]>([
         icon: 'lucide:image'
     },
     {
-        question: 'How do I choose between black bars, white bars, and transparent black?',
-        answer: 'Although pretty obvious, check the Demo page if you are unsure.',
+        question: 'How do I choose between bars and mosaic processing?',
+        answer: 'Choose the matching censorship type, or select several stages to run them in the displayed order. Mosaic uses Aletheia-Lens automatic detection, so pages without detected mosaics are left visually unchanged.',
         isOpen: false,
         category: 'usage',
         icon: 'lucide:layers'

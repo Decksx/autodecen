@@ -2,6 +2,10 @@ import os
 import subprocess
 import argparse
 import shutil
+import sys
+import traceback
+
+from aletheia_integration import build_mosaic_command
 
 def get_relative_path(full_path, workspace_root):
     """Convert a full path to a relative path from workspace root."""
@@ -18,36 +22,34 @@ def run_segmentation(model_type, segmentation_script, input_dir, output_dir, wor
     input_dir_abs = os.path.abspath(input_dir)
     output_dir_abs = os.path.abspath(output_dir)
     
-    current_dir = os.getcwd()
-    
     # Setup environment variables to ensure unbuffered output
     env = os.environ.copy()
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'UTF-8'
     env['WORKSPACE_ROOT'] = workspace_root  # Pass workspace root to child processes
     
-    try:
-        if script_dir:
-            os.chdir(script_dir)
-        
-        script_name = os.path.basename(script_path)
-        command = [
-            "python",
+    command = [
+            sys.executable,
             "-u",  # Unbuffered mode
-            script_name,
+            script_path,
             "--model_type", model_type,
             "--input_dir", input_dir_abs,
             "--output_dir", output_dir_abs
         ]
-        
+    print(f"Segmentation command: {subprocess.list2cmdline(command)}", flush=True)
+    print(f"Segmentation cwd: {script_dir}", flush=True)
+    try:
         # Use subprocess.Popen for more control over real-time output
         process = subprocess.Popen(
             command,
+            cwd=script_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True, 
             bufsize=1,  # Line buffered
             universal_newlines=True,
+            encoding='utf-8',
+            errors='replace',
             env=env
         )
         
@@ -63,8 +65,13 @@ def run_segmentation(model_type, segmentation_script, input_dir, output_dir, wor
             print(f"Segmentation process exited with code {return_code}", flush=True)
             return False
             
-    finally:
-        os.chdir(current_dir)
+    except Exception as exc:
+        print(
+            f"Segmentation launch failed ({type(exc).__name__}): {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+        return False
     
     print("Segmentation completed", flush=True)
     return True
@@ -78,11 +85,7 @@ def run_inpainting(in_dir, mask_dir, out_dir, checkpoint, inpainting_script, wor
     out_dir_abs = os.path.abspath(out_dir)
     checkpoint_abs = os.path.abspath(checkpoint)
     
-    script_name = os.path.basename(inpainting_script)
-    
     lama_root = os.path.dirname(os.path.dirname(os.path.abspath(inpainting_script)))
-    
-    current_dir = os.getcwd()
     
     env = os.environ.copy()
     env["PYTHONPATH"] = lama_root + (os.pathsep + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
@@ -93,31 +96,34 @@ def run_inpainting(in_dir, mask_dir, out_dir, checkpoint, inpainting_script, wor
     print(f"Running from lama root: {get_relative_path(lama_root, workspace_root)}", flush=True)
     print(f"Using checkpoint: {get_relative_path(checkpoint_abs, workspace_root)}", flush=True)
     
+    command = [
+        sys.executable,
+        "-u",
+        os.path.abspath(inpainting_script),
+        "--in_dir", in_dir_abs,
+        "--mask_dir", mask_dir_abs,
+        "--out_dir", out_dir_abs,
+        "--checkpoint", checkpoint_abs
+    ]
+
+    if debug_dir:
+        debug_dir_abs = os.path.abspath(debug_dir)
+        command.extend(["--debug_dir", debug_dir_abs])
+
     try:
-        os.chdir(lama_root)
-        
-        command = [
-            "python",
-            "-u",
-            os.path.join("bin", script_name),
-            "--in_dir", in_dir_abs,
-            "--mask_dir", mask_dir_abs,
-            "--out_dir", out_dir_abs,
-            "--checkpoint", checkpoint_abs
-        ]
-        
-        if debug_dir:
-            debug_dir_abs = os.path.abspath(debug_dir)
-            command.extend(["--debug_dir", debug_dir_abs])
-        
+        print(f"Inpainting command: {subprocess.list2cmdline(command)}", flush=True)
+        print(f"Inpainting cwd: {lama_root}", flush=True)
         # Use subprocess.Popen for real-time output
         process = subprocess.Popen(
             command,
+            cwd=lama_root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True, 
             bufsize=1,  # Line buffered
             universal_newlines=True,
+            encoding='utf-8',
+            errors='replace',
             env=env
         )
         
@@ -139,24 +145,65 @@ def run_inpainting(in_dir, mask_dir, out_dir, checkpoint, inpainting_script, wor
             print(f"Inpainting process exited with code {return_code}", flush=True)
             return False
             
-    finally:
-        os.chdir(current_dir)
+    except Exception as exc:
+        print(
+            f"Inpainting launch failed ({type(exc).__name__}): {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+        return False
     
     print("Inpainting completed", flush=True)
     return True
 
+
+def run_mosaic(input_dir, output_dir, workspace_root):
+    """Run Aletheia-Lens mode II in its isolated Python environment."""
+    try:
+        command = build_mosaic_command(input_dir, output_dir)
+        print(f"Aletheia-Lens command: {subprocess.list2cmdline(command)}", flush=True)
+        process = subprocess.Popen(
+            command,
+            cwd=workspace_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            encoding='utf-8',
+            errors='replace',
+            env={**os.environ, 'PYTHONUNBUFFERED': '1', 'PYTHONIOENCODING': 'UTF-8'},
+        )
+        for line in iter(process.stdout.readline, ''):
+            if line.strip():
+                print(line.rstrip(), flush=True)
+        process.stdout.close()
+        return_code = process.wait()
+    except Exception as exc:
+        print(f"Aletheia-Lens launch failed ({type(exc).__name__}): {exc}", flush=True)
+        traceback.print_exc()
+        return False
+    if return_code != 0:
+        print(f"Aletheia-Lens process exited with code {return_code}", flush=True)
+        return False
+    print("Aletheia-Lens mosaic repair completed", flush=True)
+    return True
+
 def main():
     parser = argparse.ArgumentParser(description="Pipeline to connect segmentation and inpainting.")
-    parser.add_argument("--model_type", required=True, choices=["black_bars", "white_bars", "transparent_black"],
+    parser.add_argument("--model_type", required=True, choices=["black_bars", "white_bars", "transparent_black", "mosaic"],
                         help="Model type for segmentation.")
     parser.add_argument("--clean_temp", action="store_true", 
                         help="Delete temporary files after processing is complete.")
+    parser.add_argument("--input_dir", help="Override the base input directory.")
+    parser.add_argument("--temp_dir", help="Override the segmentation/inpainting work directory.")
+    parser.add_argument("--output_dir", help="Override the final image output directory.")
     args = parser.parse_args()
     
     workspace_root = os.path.dirname(os.path.abspath(__file__))
-    camelia_input = os.path.join(workspace_root, "camelia-decensor", "input")
-    camelia_output = os.path.join(workspace_root, "camelia-decensor", "output")
-    camelia_temp = os.path.join(workspace_root, "camelia-decensor", "temp")
+    camelia_input = os.path.abspath(args.input_dir or os.path.join(workspace_root, "camelia-decensor", "input"))
+    camelia_output = os.path.abspath(args.output_dir or os.path.join(workspace_root, "camelia-decensor", "output"))
+    camelia_temp = os.path.abspath(args.temp_dir or os.path.join(workspace_root, "camelia-decensor", "temp"))
     
     # Ensure temp directory exists
     os.makedirs(camelia_temp, exist_ok=True)
@@ -164,6 +211,18 @@ def main():
     print(f"Input directory: {get_relative_path(camelia_input, workspace_root)}")
     print(f"Output directory: {get_relative_path(camelia_output, workspace_root)}")
     print(f"Temp directory: {get_relative_path(camelia_temp, workspace_root)}")
+
+    if args.model_type == "mosaic":
+        mosaic_success = run_mosaic(
+            input_dir=os.path.join(camelia_input, "mosaic"),
+            output_dir=camelia_output,
+            workspace_root=workspace_root,
+        )
+        if not mosaic_success:
+            print("Mosaic repair failed. Exiting pipeline.", flush=True)
+            return 1
+        print("Processing complete!")
+        return 0
 
     # Run segmentation
     segmentation_success = run_segmentation(
@@ -176,7 +235,7 @@ def main():
 
     if not segmentation_success:
         print("Segmentation failed. Exiting pipeline.", flush=True)
-        return
+        return 1
 
     # Run inpainting
     inpainting_success = run_inpainting(
@@ -190,7 +249,7 @@ def main():
     
     if not inpainting_success:
         print("Inpainting failed. Exiting pipeline.", flush=True)
-        return
+        return 1
     
     # Clean up temporary directory if args is set
     if args.clean_temp:
@@ -226,6 +285,7 @@ def main():
             print(f"Error cleaning temporary directory contents: {e}")
             
     print("Processing complete!")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

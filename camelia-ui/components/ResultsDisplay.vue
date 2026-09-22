@@ -1,11 +1,11 @@
 <template>
     <div class="container">
         <div
-            v-if="results.length"
+            v-if="results.length || archiveResults.length"
             class="bg-surface rounded-lg border border-overlay shadow-lg p-6 mb-8">
             <div class="flex justify-between items-center mb-6">
                 <h2 class="text-2xl font-medium text-foam">Results</h2>
-                <div class="flex items-center space-x-3">
+                <div v-if="results.length" class="flex items-center space-x-3">
                     <div class="relative">
                         <select
                             v-model="downloadFormat"
@@ -29,10 +29,44 @@
                 </div>
             </div>
 
+            <div v-if="archiveResults.length" class="mb-6 space-y-3">
+                <div
+                    v-for="archiveResult in archiveResults"
+                    :key="archiveResult.local_path || archiveResult.downloadUrl || archiveResult.filename"
+                    class="rounded-md border border-pine bg-base p-4 text-text">
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                            <p class="font-medium text-foam">{{ archiveResult.filename }}</p>
+                            <p
+                                v-if="archiveResult.local_path"
+                                class="mt-1 break-all text-sm text-subtle">
+                                Saved to {{ archiveResult.local_path }}
+                            </p>
+                            <p
+                                v-if="archiveResult.original_deleted"
+                                class="mt-1 text-sm text-pine">
+                                Replacement verified; original censored archive deleted.
+                            </p>
+                        </div>
+                        <a
+                            v-if="archiveResult.downloadUrl"
+                            :href="archiveResult.downloadUrl"
+                            :download="archiveResult.filename"
+                            class="rounded-md bg-iris px-4 py-2 text-base hover:bg-iris-dark transition-colors">
+                            Download CBZ
+                        </a>
+                    </div>
+                </div>
+            </div>
+
             <div
-                class="grid grid-cols-1 md:grid-cols-2 gap-6 max-h-lvh overflow-y-auto custom-webkit pr-2">
+                v-if="results.length"
+                class="grid grid-cols-1 gap-6 max-h-lvh overflow-y-auto custom-webkit pr-2"
+                :class="{ 'md:grid-cols-2': hasOriginals }">
                 <!-- Original images column -->
-                <div class="bg-base rounded-lg border border-highlight-low overflow-hidden">
+                <div
+                    v-if="hasOriginals"
+                    class="bg-base rounded-lg border border-highlight-low overflow-hidden">
                     <h3
                         class="text-sm font-medium text-iris uppercase tracking-wider p-4 border-b border-highlight-low">
                         Original Images
@@ -86,7 +120,7 @@
 <script setup lang="ts">
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { ref } from 'vue';
+import { computed, ref } from 'vue';
 
 interface ResultItem {
     filename: string;
@@ -94,12 +128,22 @@ interface ResultItem {
     processed: string;
 }
 
+interface ArchiveResult {
+    filename: string;
+    downloadable: boolean;
+    local_path: string | null;
+    original_deleted: boolean;
+    downloadUrl: string | null;
+}
+
 const props = defineProps<{
     results: ResultItem[];
+    archiveResults: ArchiveResult[];
 }>();
 
 const downloadFormat = ref('png');
 const isDownloading = ref(false);
+const hasOriginals = computed(() => props.results.some((result) => Boolean(result.original)));
 
 async function downloadAllImages(): Promise<void> {
     if (isDownloading.value) return;
