@@ -58,6 +58,7 @@
                     Stop after current book
                 </button>
             </div>
+            <p v-if="actionError" class="text-sm text-love">{{ actionError }}</p>
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm text-text">
                 <label class="flex items-center gap-2">
@@ -149,7 +150,7 @@
                 </div>
             </div>
 
-            <p v-if="error" class="text-sm text-love">{{ error }}</p>
+            <p v-if="refreshError" class="text-sm text-love">{{ refreshError }}</p>
             <div v-if="status?.events.length" class="max-h-48 overflow-auto rounded-md bg-base border border-overlay p-3 font-mono text-xs text-subtle">
                 <div v-for="event in status.events.slice(-12)" :key="event.id" class="py-1">
                     [{{ formatLocalTimestamp(event.created_at) }}] [{{ event.event_type }}] {{ event.message }}
@@ -178,7 +179,6 @@ const selectedRoot = ref(fallbackRoots[0]);
 const busy = ref(false);
 const actionError = ref('');
 const refreshError = ref('');
-const error = computed(() => actionError.value || refreshError.value);
 const bookPath = ref('');
 const manualMethods = ref<ProcessingType[]>(['black_bars']);
 const manualReprocess = ref(false);

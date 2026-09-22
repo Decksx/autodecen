@@ -55,6 +55,7 @@ class LibraryBacklogTests(unittest.TestCase):
             while time.time() < deadline and store.scan_status(scan_id) != "completed":
                 time.sleep(0.02)
             self.assertEqual(store.scan_status(scan_id), "completed")
+            self.assertIsNone(store.snapshot()["current_file"])
             with store.connect() as db:
                 paths = [row[0] for row in db.execute("SELECT source_path FROM books")]
             self.assertEqual(paths, [str(visible)])
@@ -150,6 +151,78 @@ class LibraryBacklogTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "backup offload"):
                 manager.set_batch_schedule(True)
             self.assertFalse(store.schedule_enabled())
+
+    def test_resume_rejects_unavailable_root_before_retrying_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            manager = LibraryBacklog(store, lambda *_: None)
+
+            with patch("library_backlog.os.path.isdir", return_value=False):
+                with self.assertRaisesRegex(ValueError, "unavailable to Camelia"):
+                    manager.resume_queue()
+
+            progress = store.book_progress(str(archive))
+            self.assertEqual(progress["attempts"], 0)
+            self.assertEqual(progress["state"], "queued")
+            self.assertEqual(store.queue_control(), "paused")
+            self.assertIsNone(manager._queue_thread)
+
+    def test_missing_book_does_not_stop_other_queued_books(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            missing = root / "Missing.cbz"
+            available = root / "Available.cbz"
+            make_cbz(missing)
+            make_cbz(available)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for archive in (missing, available):
+                store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            missing.unlink()
+
+            def processor(path, sequence, _job):
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(store, processor)
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(available))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+
+            self.assertEqual(store.book_progress(str(missing))["state"], "failed")
+            self.assertEqual(store.book_progress(str(available))["state"], "completed")
+            self.assertTrue(any(event["event_type"] == "job_failed" for event in store.snapshot()["events"]))
+
+    def test_unavailable_root_after_claim_does_not_consume_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+            job = store.claim_job()
+            manager = LibraryBacklog(store, lambda *_: None)
+
+            with patch("library_backlog.os.path.isdir", return_value=False):
+                paused = manager._handle_source_access_error(
+                    job, FileNotFoundError("mapped drive unavailable"), "Source preflight failed"
+                )
+
+            self.assertTrue(paused)
+            progress = store.book_progress(str(archive))
+            self.assertEqual(progress["attempts"], 0)
+            self.assertEqual(progress["state"], "queued")
+            self.assertEqual(store.queue_control(), "paused")
+            self.assertTrue(any(event["event_type"] == "job_deferred" for event in store.snapshot()["events"]))
 
     def test_x_source_registration_precedes_processor_and_failure_pauses(self):
         with tempfile.TemporaryDirectory() as directory:

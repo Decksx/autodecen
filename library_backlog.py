@@ -716,6 +716,20 @@ class BacklogStore:
                 (root_path, int(include_failed)),
             ).fetchone() is not None
 
+    def pending_roots(self, include_failed: bool = False,
+                      root_path: str | None = None,
+                      exclude_root: str | None = None) -> list[str]:
+        """Return roots whose eligible jobs the queue could claim on resume."""
+        with self.connect() as db:
+            return [row["root_path"] for row in db.execute(
+                """SELECT DISTINCT root_path FROM books
+                   WHERE (state='queued' OR (? AND state='failed'))
+                     AND attempts <= max_retries
+                     AND (? IS NULL OR root_path = ? COLLATE NOCASE)
+                     AND (? IS NULL OR root_path <> ? COLLATE NOCASE)""",
+                (int(include_failed), root_path, root_path, exclude_root, exclude_root),
+            )]
+
     def control_scheduled_autostart(self, enabled: bool) -> None:
         with self.connect() as db:
             db.execute(
@@ -918,6 +932,21 @@ class BacklogStore:
             )
             self._event(db, "job_failed", f"Processing failed: {error} (attempt {row['attempts']})", book_id=book_id)
 
+    def defer_job(self, book_id: int, reason: str) -> None:
+        """Undo a claim made before an unavailable source root was detected."""
+        with self.connect() as db:
+            row = db.execute("SELECT state FROM books WHERE id=?", (book_id,)).fetchone()
+            if row is None or row["state"] != "processing":
+                raise ValueError(f"Cannot defer book {book_id} unless it is processing")
+            now = utc_now()
+            db.execute(
+                """UPDATE books SET state='queued', attempts=MAX(0, attempts-1),
+                   current_stage=NULL, started_at=NULL, last_error=?, updated_at=?
+                   WHERE id=?""",
+                (reason, now, book_id),
+            )
+            self._event(db, "job_deferred", reason, book_id=book_id)
+
     def skip_job(self, book_id: int, reason: str) -> None:
         with self.connect() as db:
             db.execute(
@@ -1065,7 +1094,10 @@ class BacklogStore:
                     **processing_window_status(),
                 },
                 "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "processing", "completed", "failed", "skipped")},
-                "current_file": current["source_path"] if current else (scan["current_path"] if scan else None),
+                "current_file": (
+                    current["source_path"] if current else
+                    scan["current_path"] if scan and scan["status"] in {"running", "paused"} else None
+                ),
                 "current_stage": current["current_stage"] if current else None,
                 "recent_books": self._progress_rows(db, recent),
                 "events": list(reversed(events)),
@@ -1191,6 +1223,14 @@ class LibraryBacklog:
             raise ValueError("X:\\comix jobs require ComicAutomation database handoff configuration")
         if self.store.schedule_enabled() and self.sync_callback is None:
             raise ValueError("Scheduled X:\\comix processing requires ComicAutomation database handoff")
+        scheduled = self.store.schedule_enabled()
+        for root in self.store.pending_roots(
+            include_failed=retry_failed,
+            root_path=SCHEDULE_ROOT if scheduled else None,
+            exclude_root=SCHEDULE_ROOT if self.sync_callback is None else None,
+        ):
+            if not os.path.isdir(root):
+                raise ValueError(self._unavailable_root_message(root))
         retried = self.store.retry_failed() if retry_failed else 0
         if self.store.schedule_enabled():
             self.store.control_scheduled_autostart(True)
@@ -1200,6 +1240,27 @@ class LibraryBacklog:
                 self._queue_thread = threading.Thread(target=self._process_queue, daemon=True, name="library-backlog")
                 self._queue_thread.start()
         return retried
+
+    @staticmethod
+    def _unavailable_root_message(root: str) -> str:
+        return (
+            f"Library root is unavailable to Camelia: {root}. If this is a mapped drive, "
+            "reconnect it in the Windows session that started Camelia, then resume the queue."
+        )
+
+    def _handle_source_access_error(self, job: dict, error: OSError, context: str) -> bool:
+        """Return True when the queue must pause, False for one missing book."""
+        root = job["root_path"]
+        if isinstance(error, FileNotFoundError) and os.path.isdir(root):
+            self.store.fail_job(job["id"], f"{context}: {error}")
+            return False
+        reason = (
+            self._unavailable_root_message(root) if not os.path.isdir(root)
+            else f"{context}: {error}"
+        )
+        self.store.defer_job(job["id"], reason)
+        self.pause_queue()
+        return True
 
     def set_batch_schedule(self, enabled: bool) -> None:
         """Opt-in scheduled processing; disabling never frees a running job."""
@@ -1277,7 +1338,11 @@ class LibraryBacklog:
                 current = os.stat(job["source_path"])
                 if (current.st_size, current.st_mtime_ns) != (job["file_size"], job["mtime_ns"]):
                     raise RuntimeError("Source changed since discovery; recrawl or review an interrupted replacement before retrying")
-            except (OSError, RuntimeError) as exc:
+            except OSError as exc:
+                if self._handle_source_access_error(job, exc, "Source preflight failed"):
+                    return
+                continue
+            except RuntimeError as exc:
                 self.store.fail_job(book_id, f"Source preflight failed: {exc}")
                 self.pause_queue()
                 return
@@ -1299,7 +1364,11 @@ class LibraryBacklog:
                 current = os.stat(job["source_path"])
                 if (current.st_size, current.st_mtime_ns) != (job["file_size"], job["mtime_ns"]):
                     raise RuntimeError("Source changed since discovery; recrawl or review an interrupted replacement before retrying")
-            except (OSError, RuntimeError) as exc:
+            except OSError as exc:
+                if self._handle_source_access_error(job, exc, "Source changed during preflight"):
+                    return
+                continue
+            except RuntimeError as exc:
                 self.store.fail_job(book_id, f"Source changed during preflight: {exc}")
                 self.pause_queue()
                 return
