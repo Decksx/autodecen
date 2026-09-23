@@ -1237,7 +1237,8 @@ def _configured_backup_offload():
         if run.returncode:
             raise RuntimeError((run.stderr or run.stdout or "Original backup offload failed").strip()[:1200])
         if result is not None:
-            app.logger.info("Backlog original archived on F: %s", run.stdout.strip())
+            app.logger.info("Backlog original archived on F: %s",
+                            (run.stdout or "").strip() or destination)
 
     return offload
 

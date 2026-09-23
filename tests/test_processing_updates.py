@@ -20,6 +20,17 @@ from scripts import process_cbz
 
 
 class ProcessingUpdateTests(unittest.TestCase):
+    def test_successful_backup_offload_accepts_missing_command_output(self):
+        completed = mock.Mock(returncode=0, stdout=None, stderr=None)
+        with mock.patch.object(api.os.path, 'isfile', return_value=True), \
+                mock.patch.object(api.os.path, 'isdir', return_value=True), \
+                mock.patch.object(api.shutil, 'disk_usage', return_value=mock.Mock(free=2**40)), \
+                mock.patch.object(api.subprocess, 'run', return_value=completed) as run:
+            offload = api._configured_backup_offload()
+            self.assertIsNotNone(offload)
+            offload({'source_path': 'book.cbz'}, {'backup_path': 'original.cbz'})
+        self.assertIn('--source-file', run.call_args.args[0])
+
     def test_job_logs_use_full_local_timestamp_and_pass_duration(self):
         session_id = 'timing-test'
         api.process_logs[session_id] = queue.Queue()
