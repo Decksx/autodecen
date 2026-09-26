@@ -30,6 +30,28 @@ class ProcessingUpdateTests(unittest.TestCase):
             self.assertIsNotNone(offload)
             offload({'source_path': 'book.cbz'}, {'backup_path': 'original.cbz'})
         self.assertIn('--source-file', run.call_args.args[0])
+        self.assertEqual(
+            run.call_args.args[0][run.call_args.args[0].index('--fallback-series') + 1],
+            '_Unclassified',
+        )
+
+    def test_backup_offload_uses_library_series_folder_as_metadata_fallback(self):
+        completed = mock.Mock(returncode=0, stdout='', stderr='')
+        with mock.patch.object(api.os.path, 'isfile', return_value=True), \
+                mock.patch.object(api.os.path, 'isdir', return_value=True), \
+                mock.patch.object(api.shutil, 'disk_usage', return_value=mock.Mock(free=2**40)), \
+                mock.patch.object(api.subprocess, 'run', return_value=completed) as run:
+            offload = api._configured_backup_offload()
+            self.assertIsNotNone(offload)
+            offload(
+                {
+                    'source_path': r'Z:\comics\Comix\Series Name\Book.cbz',
+                    'root_path': r'Z:\comics\Comix',
+                },
+                {'backup_path': r'C:\Backups\Book.cbz'},
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index('--fallback-series') + 1], 'Series Name')
 
     def test_job_logs_use_full_local_timestamp_and_pass_duration(self):
         session_id = 'timing-test'

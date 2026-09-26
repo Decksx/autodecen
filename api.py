@@ -1212,6 +1212,21 @@ def _configured_backup_offload():
         return None
     source_root = os.path.join(BACKLOG_STATE_DIR, "originals")
 
+    def fallback_series(job):
+        if not job:
+            return "_Unclassified"
+        source = os.path.abspath(str(job.get("source_path") or ""))
+        root = os.path.abspath(str(job.get("root_path") or ""))
+        parent = os.path.basename(os.path.dirname(source)).strip()
+        try:
+            uuid.UUID(parent)
+            parent = ""
+        except ValueError:
+            pass
+        if parent and os.path.normcase(os.path.dirname(source)) != os.path.normcase(root):
+            return parent
+        return "_Unclassified"
+
     def offload(job, result):
         drive = os.path.splitdrive(destination)[0] + os.sep
         if not os.path.isdir(drive):
@@ -1224,6 +1239,7 @@ def _configured_backup_offload():
         command = [
             suite_python, "-m", "scripts.ai_decensor_backups",
             "--source-root", source_root, "--destination-root", destination, "--apply",
+            "--fallback-series", fallback_series(job),
         ]
         if result is not None:
             backup_path = result.get("backup_path")
