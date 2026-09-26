@@ -39,7 +39,7 @@
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm">
                 <div class="flex flex-wrap gap-x-6 gap-y-1">
                     <span class="text-text">Crawl: <strong class="text-foam">{{ scan?.status ?? 'not started' }}</strong></span>
-                    <span class="text-text">Queue: <strong class="text-foam">{{ status?.queue_status ?? 'paused' }}</strong></span>
+                    <span class="text-text">Queue: <strong class="text-foam">{{ status?.queue_status ?? 'paused' }}<template v-if="(status?.counts.processing ?? 0) > 0 && status?.queue_status !== 'running'"> — current book still processing</template></strong></span>
                     <span v-if="status?.current_stage" class="text-text">Stage: <strong class="text-foam">{{ status.current_stage }}</strong></span>
                 </div>
                 <div class="text-xs text-subtle break-all">
@@ -57,7 +57,14 @@
                 <button class="rounded-md px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 bg-love text-base" :disabled="busy || status?.queue_status === 'stopped'" @click="queueAction('stop')">
                     Stop after current book
                 </button>
+                <button class="rounded-md px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 bg-love text-base" :disabled="busy || (status?.counts.processing ?? 0) === 0" @click="queueAction('cancel-current')">
+                    Cancel current book
+                </button>
             </div>
+            <p class="text-xs text-subtle">
+                Cancel current book stops its active detector/model process, leaves the source archive unchanged,
+                and marks that book skipped. Cancellation is disabled once rebuilt-archive installation begins.
+            </p>
             <p v-if="actionError" class="text-sm text-love">{{ actionError }}</p>
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm text-text">
@@ -68,8 +75,9 @@
                     Only process books with a detected censorship type
                 </label>
                 <p class="text-xs text-subtle">
-                    When enabled, Camelia checks every page of each queued CBZ, runs only detected passes,
-                    and leaves books with no reliable detection unchanged for review.
+                    When enabled, Camelia assigns at most one treatment to each page. Bar censorship takes
+                    priority, and finding a bar type suppresses mosaic processing for that book.
+                    Books with no reliable detection stay unchanged for review.
                     Manually queued methods override this check. Pause the queue to change this option.
                 </p>
             </div>
@@ -108,16 +116,23 @@
                 <h3 class="text-sm text-foam">Queue one previously crawled book</h3>
                 <input v-model="bookPath" type="text" placeholder="Full path to a CBZ in the crawled library"
                     class="w-full rounded-md bg-surface border border-overlay px-3 py-2 text-sm text-text" />
-                <div class="flex flex-wrap gap-3 text-xs text-text">
+                <div class="flex flex-wrap items-center gap-3 text-xs text-text">
                     <label v-for="method in methodChoices" :key="method.value" class="flex items-center gap-1">
                         <input v-model="manualMethods" type="checkbox" :value="method.value" />
                         {{ method.label }}
                     </label>
+                    <button type="button" class="text-iris hover:text-foam" @click="selectAllManualMethods">
+                        Select all methods
+                    </button>
                 </div>
                 <label class="flex items-center gap-2 text-xs text-text">
                     <input v-model="manualReprocess" type="checkbox" />
                     Reprocess selected methods even if their tags are already present
                 </label>
+                <p class="text-xs text-subtle">
+                    Manual queueing bypasses automatic page assignments and runs every selected method across
+                    the entire book. Select all plus Reprocess to force a complete repeat.
+                </p>
                 <button class="rounded-md px-4 py-2 text-sm font-medium bg-iris text-base disabled:opacity-40"
                     :disabled="busy || !bookPath.trim() || manualMethods.length === 0" @click="queueBook">
                     Queue this book
@@ -270,7 +285,7 @@ function scanAction(action: 'pause' | 'stop'): void {
     void run(() => controlLibraryScan(scan.value!.id, action));
 }
 
-function queueAction(action: 'pause' | 'resume' | 'stop'): void {
+function queueAction(action: 'pause' | 'resume' | 'stop' | 'cancel-current'): void {
     void run(() => controlLibraryQueue(action));
 }
 
@@ -299,6 +314,10 @@ function queueBook(): void {
         await requeueLibraryBook(path, selected, manualReprocess.value);
         lookedUpBook.value = await getLibraryBookProgress(path);
     });
+}
+
+function selectAllManualMethods(): void {
+    manualMethods.value = methodChoices.map((item) => item.value);
 }
 
 function lookupBook(): void {

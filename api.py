@@ -56,6 +56,14 @@ process_status = {}
 processing_lock = threading.Lock()
 active_processes = {}
 process_log_listeners = {}
+backlog_process_sessions = {}
+backlog_detector_processes = {}
+finalizing_sessions = set()
+backlog_runtime_lock = threading.Lock()
+
+
+class ProcessingCancelled(RuntimeError):
+    pass
 
 
 def normalize_model_types(model_types):
@@ -89,6 +97,56 @@ def job_log(session_id, step, message):
         except Exception:
             app.logger.exception("Processing log listener failed for %s", session_id)
     return line
+
+
+def _terminate_process_tree(process):
+    """Stop one model/detector subprocess and any children it launched."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        parent = psutil.Process(process.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            child.terminate()
+        parent.terminate()
+        _, alive = psutil.wait_procs([*children, parent], timeout=3)
+        for remaining in alive:
+            remaining.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        if process.poll() is None:
+            process.terminate()
+
+
+def _cancel_processing_session(session_id):
+    """Cancel a session before the atomic archive-finalization boundary."""
+    with backlog_runtime_lock:
+        if session_id in finalizing_sessions:
+            return False
+        if process_status.get(session_id) != "processing":
+            return False
+        process_status[session_id] = "cancelled"
+        running_process = active_processes.get(session_id)
+    job_log(session_id, 'CANCEL', 'Cancellation requested by user')
+    _terminate_process_tree(running_process)
+    if running_process is not None:
+        job_log(session_id, 'CANCEL', f'Stopped subprocess tree rooted at PID {running_process.pid}')
+    return True
+
+
+def _cancel_backlog_work(job):
+    """Cancel the detector or model process associated with one backlog book."""
+    book_id = job["id"]
+    with backlog_runtime_lock:
+        detector = backlog_detector_processes.get(book_id)
+        session_id = backlog_process_sessions.get(book_id)
+    if detector is not None:
+        _terminate_process_tree(detector)
+        return True
+    if session_id is not None:
+        return _cancel_processing_session(session_id)
+    # The worker is between safe phases and will observe the manager's
+    # cancellation flag before it starts the next expensive operation.
+    return True
 
 
 @contextmanager
@@ -301,6 +359,7 @@ def extract_cbz_images(archive_path, target_dir, used_names):
 
             extracted_paths = []
             page_member_indices = []
+            page_member_names = []
             for index, (member_index, member) in enumerate(members, start=1):
                 if member.flag_bits & 0x1:
                     raise ValueError("Encrypted CBZ archives are not supported")
@@ -335,10 +394,12 @@ def extract_cbz_images(archive_path, target_dir, used_names):
                     ) from exc
                 extracted_paths.append(destination)
                 page_member_indices.append(member_index)
+                page_member_names.append(member.filename.replace('\\', '/'))
 
             return extracted_paths, {
                 "archive_path": archive_path,
                 "page_member_indices": page_member_indices,
+                "page_member_names": page_member_names,
             }
     except zipfile.BadZipFile as e:
         raise ValueError("The selected CBZ is not a valid ZIP archive") from e
@@ -548,10 +609,11 @@ def _copy_archive_with_processed_pages(source_archive, destination, results, pag
                     payload = b''
                 else:
                     original_bytes = source.read(member)
-                    if index in replacements:
+                    replacement = replacements.get(index)
+                    if replacement and replacement.get("processed_path"):
                         extension = member.filename.rsplit('.', 1)[-1]
                         payload = _encode_processed_page(
-                            replacements[index]["processed_path"],
+                            replacement["processed_path"],
                             original_bytes,
                             extension,
                         )
@@ -560,8 +622,14 @@ def _copy_archive_with_processed_pages(source_archive, destination, results, pag
                 target.writestr(cloned_member, payload)
 
 
-def _verify_rebuilt_archive(source_archive, rebuilt_archive, page_indices):
+def _verify_rebuilt_archive(source_archive, rebuilt_archive, page_indices, results=None):
     """Verify structure, metadata, unchanged payloads, and processed images."""
+    page_indices = list(page_indices)
+    processed_page_indices = (
+        {index for index, result in zip(page_indices, results)
+         if result.get("processed_path")}
+        if results is not None else set(page_indices)
+    )
     page_indices = set(page_indices)
     with zipfile.ZipFile(source_archive) as source, zipfile.ZipFile(rebuilt_archive) as rebuilt:
         source_members = source.infolist()
@@ -581,6 +649,10 @@ def _verify_rebuilt_archive(source_archive, rebuilt_archive, page_indices):
             if index in page_indices:
                 with rebuilt.open(after) as page_file, Image.open(page_file) as page_image:
                     page_image.verify()
+                if index not in processed_page_indices and source.read(before) != rebuilt.read(after):
+                    raise RuntimeError(
+                        f"Unassigned image payload changed: {before.filename}"
+                    )
             elif not before.is_dir() and source.read(before) != rebuilt.read(after):
                 raise RuntimeError(
                     f"Non-image archive member changed: {before.filename}"
@@ -679,6 +751,7 @@ def create_processed_cbz(results, archive_context, session_id):
                 filesystem_path(source_archive),
                 filesystem_path(temporary_path),
                 page_indices,
+                results,
             )
 
         with timed_job_step(session_id, 'comicinfo_tagging', 'ComicInfo.xml tagging'):
@@ -743,6 +816,8 @@ def create_processed_cbz(results, archive_context, session_id):
             original_deleted = True
 
         for result in results:
+            if not result.get("processed_path"):
+                continue
             try:
                 os.unlink(result["processed_path"])
             except OSError as e:
@@ -861,6 +936,8 @@ def _run_model_pass(image_paths, model_type, session_id, pass_number,
             env=env,
         )
         active_processes[session_id] = process
+        if process_status.get(session_id) == 'cancelled':
+            _terminate_process_tree(process)
         for line in iter(process.stdout.readline, ''):
             line = line.rstrip()
             if line:
@@ -876,6 +953,8 @@ def _run_model_pass(image_paths, model_type, session_id, pass_number,
     finally:
         active_processes.pop(session_id, None)
 
+    if process_status.get(session_id) == 'cancelled':
+        raise ProcessingCancelled("Processing cancelled by user")
     if return_code != 0:
         output_context = ' | '.join(recent_output) or '<no subprocess output>'
         raise RuntimeError(
@@ -896,13 +975,78 @@ def _run_model_pass(image_paths, model_type, session_id, pass_number,
     return results
 
 
-def process_images(image_paths, model_types, session_id, job_work_dir):
-    """Run one or more model passes sequentially in an isolated workspace."""
+def process_images(image_paths, model_types, session_id, job_work_dir,
+                   page_method_sequence=None):
+    """Run whole-book sequential passes or one detected method per page."""
     model_types = normalize_model_types(model_types)
+    if page_method_sequence is not None:
+        if len(page_method_sequence) != len(image_paths):
+            raise ValueError("The detected page plan does not match the extracted page count")
+        unknown = set(filter(None, page_method_sequence)).difference(model_types)
+        if unknown:
+            raise ValueError(
+                f"The detected page plan contains unselected method(s): {', '.join(sorted(unknown))}"
+            )
+        active_models = [model for model in model_types if model in page_method_sequence]
+        if not active_models:
+            raise ValueError("The detected page plan contains no pages to process")
+        _validate_runtime_files(active_models)
+        final_results = [
+            {"filename": os.path.basename(path), "processed_path": None}
+            for path in image_paths
+        ]
+        for pass_number, model_type in enumerate(active_models, start=1):
+            if process_status.get(session_id) == 'cancelled':
+                raise ProcessingCancelled("Processing cancelled by user")
+            selected_indices = [
+                index for index, method in enumerate(page_method_sequence)
+                if method == model_type
+            ]
+            selected_paths = [image_paths[index] for index in selected_indices]
+            pass_started = time.perf_counter()
+            job_log(
+                session_id,
+                'PASS',
+                f"Starting {model_type} ({pass_number}/{len(active_models)}) on "
+                f"{len(selected_paths)} detected page(s)",
+            )
+            try:
+                selected_results = _run_model_pass(
+                    selected_paths,
+                    model_type,
+                    session_id,
+                    pass_number,
+                    len(active_models),
+                    job_work_dir,
+                )
+            except Exception as exc:
+                duration = time.perf_counter() - pass_started
+                job_log(
+                    session_id,
+                    'PASS',
+                    f"Failed {model_type} ({pass_number}/{len(active_models)}): "
+                    f"{type(exc).__name__}: {exc} ({format_elapsed_duration(duration)})",
+                )
+                raise
+            if process_status.get(session_id) == 'cancelled':
+                raise ProcessingCancelled("Processing cancelled by user")
+            for index, result in zip(selected_indices, selected_results):
+                final_results[index] = result
+            duration = time.perf_counter() - pass_started
+            job_log(
+                session_id,
+                'PASS',
+                f"Completed {model_type} ({pass_number}/{len(active_models)}): "
+                f"{len(selected_results)} detected page(s) ({format_elapsed_duration(duration)})",
+            )
+        return session_id, final_results
+
     _validate_runtime_files(model_types)
     current_paths = list(image_paths)
     results = []
     for pass_number, model_type in enumerate(model_types, start=1):
+        if process_status.get(session_id) == 'cancelled':
+            raise ProcessingCancelled("Processing cancelled by user")
         pass_started = time.perf_counter()
         job_log(
             session_id,
@@ -928,6 +1072,8 @@ def process_images(image_paths, model_types, session_id, job_work_dir):
             )
             raise
         duration = time.perf_counter() - pass_started
+        if process_status.get(session_id) == 'cancelled':
+            raise ProcessingCancelled("Processing cancelled by user")
         job_log(
             session_id,
             'PASS',
@@ -942,7 +1088,8 @@ def process_images_thread(
     model_types,
     session_id,
     upload_dir,
-    archive_context=None
+    archive_context=None,
+    page_method_sequence=None,
 ):
     """Run the image processing in a separate thread."""
     succeeded = False
@@ -956,11 +1103,16 @@ def process_images_thread(
                 model_types,
                 session_id,
                 job_work_dir,
+                page_method_sequence=page_method_sequence,
             )
 
             if result_session_id and results:
                 if archive_context:
                     archive_context["completed_methods"] = normalize_model_types(model_types)
+                    with backlog_runtime_lock:
+                        if process_status.get(session_id) == 'cancelled':
+                            raise ProcessingCancelled("Processing cancelled by user")
+                        finalizing_sessions.add(session_id)
                     archive_result = create_processed_cbz(
                         results,
                         archive_context,
@@ -990,20 +1142,23 @@ def process_images_thread(
                 # and normally set the status to "error".
                 process_status[session_id] = "error"
 
+        except ProcessingCancelled:
+            process_status[session_id] = "cancelled"
+            job_log(session_id, 'CANCEL', 'Active processing stopped at a safe boundary')
         except Exception as e:
             app.logger.exception(
                 f"Thread error for session {session_id}: {e}"
             )
-            if process_status.get(session_id) == 'cancelled':
-                job_log(session_id, 'CANCEL', 'Active subprocess stopped')
-            else:
-                job_log(
-                    session_id,
-                    'ERROR',
-                    f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
-                )
-                process_status[session_id] = "error"
+            job_log(
+                session_id,
+                'ERROR',
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+            )
+            process_status[session_id] = "error"
         finally:
+            if not succeeded:
+                with backlog_runtime_lock:
+                    finalizing_sessions.discard(session_id)
             try:
                 if not succeeded:
                     shutil.rmtree(
@@ -1023,7 +1178,9 @@ def process_images_thread(
     if process_status.get(session_id) == 'cancelled':
         job_log(session_id, 'CANCEL', 'Job cancelled')
     elif succeeded:
-        process_status[session_id] = "completed"
+        with backlog_runtime_lock:
+            finalizing_sessions.discard(session_id)
+            process_status[session_id] = "completed"
         job_log(session_id, 'COMPLETE', 'Job finished successfully')
     else:
         process_status[session_id] = "error"
@@ -1038,8 +1195,10 @@ def process_cbz_archive_sync(
     model_types=None,
     destination_dir=None,
     event_callback=None,
+    session_callback=None,
     output_dir=None,
     reprocess=False,
+    page_methods=None,
 ):
     """Process one local CBZ synchronously for CLI and integration callers.
 
@@ -1087,7 +1246,20 @@ def process_cbz_archive_sync(
         job_log(session_id, 'SKIP', f"All requested decensor methods are already recorded for {source_path}; use --reprocess to override")
         return {"status": "skipped", "path": source_path, "applied_methods": inspection["applied_methods"]}, session_id
     selected_models = pending_models
+    if page_methods is not None:
+        page_methods = {
+            method: list(page_methods.get(method, ())) for method in MODEL_TYPES
+        }
+        if any(page_methods[method] for method in MODEL_TYPES[:3]):
+            page_methods["mosaic"] = []
+        selected_models = [
+            method for method in selected_models if page_methods[method]
+        ]
+        if not selected_models:
+            raise ValueError("The detected page plan contains no pending pages to process")
     process_status[session_id] = "processing"
+    if session_callback is not None:
+        session_callback(session_id)
     if event_callback is not None:
         process_log_listeners[session_id] = event_callback
     temp_dir = tempfile.mkdtemp()
@@ -1105,6 +1277,24 @@ def process_cbz_archive_sync(
             temp_dir,
             set(),
         )
+        page_method_sequence = None
+        if page_methods is not None:
+            normalized_page_methods = {}
+            for method in selected_models:
+                for name in page_methods[method]:
+                    normalized_page_methods.setdefault(
+                        str(name).replace('\\', '/'), method
+                    )
+            member_names = archive_details["page_member_names"]
+            missing_names = sorted(set(normalized_page_methods).difference(member_names))
+            if missing_names:
+                raise ValueError(
+                    "Detected page plan no longer matches the archive: "
+                    + ", ".join(missing_names[:5])
+                )
+            page_method_sequence = [
+                normalized_page_methods.get(name) for name in member_names
+            ]
         context = {
             **archive_details,
             "original_name": os.path.basename(source_path),
@@ -1120,6 +1310,7 @@ def process_cbz_archive_sync(
             session_id,
             temp_dir,
             context,
+            page_method_sequence=page_method_sequence,
         )
         if process_status.get(session_id) != "completed":
             messages = []
@@ -1324,30 +1515,79 @@ def _process_backlog_archive(source_path, sequence, job):
             )
             return
 
-    result, _session_id = process_cbz_archive_sync(
-        source_path,
-        model_types=sequence,
-        output_mode="replace",
-        backup_dir=backup_root,
-        destination_dir=job["root_path"],
-        event_callback=record_pipeline_event,
+    book_id = job["id"]
+
+    def register_session(session_id):
+        with backlog_runtime_lock:
+            backlog_process_sessions[book_id] = session_id
+
+    page_methods = None
+    if job.get("auto_detect") and job.get("detected_pages"):
+        page_methods = json.loads(job["detected_pages"])
+
+    try:
+        result, _session_id = process_cbz_archive_sync(
+            source_path,
+            model_types=sequence,
+            output_mode="replace",
+            backup_dir=backup_root,
+            destination_dir=job["root_path"],
+            event_callback=record_pipeline_event,
+            session_callback=register_session,
+            page_methods=page_methods,
+        )
+        return result
+    finally:
+        with backlog_runtime_lock:
+            backlog_process_sessions.pop(book_id, None)
+
+
+def _decode_detector_output(payload):
+    """Decode mixed Python UTF-8 and Windows ONNX UTF-16LE console output."""
+    if isinstance(payload, bytes):
+        text = payload.decode("utf-8", errors="replace")
+    else:
+        text = str(payload or "")
+    text = text.replace("\x00", "")
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return "\n".join(
+        line for line in text.splitlines()
+        if not (
+            "onnxruntime::UpsampleBase" in line
+            and "tf_half_pixel_for_nn" in line
+        )
     )
-    return result
 
 
 def _detect_backlog_censorship(source_path, _job):
     """Audit all pages without changing the source or loading models in Flask."""
     root, mosaic_python = validate_aletheia_runtime()
     script = os.path.join(WORKSPACE_ROOT, "censorship_detection.py")
-    run = subprocess.run(
+    process = subprocess.Popen(
         [str(mosaic_python), "-u", script, "--archive", source_path,
          "--aletheia-root", str(root)],
-        cwd=WORKSPACE_ROOT, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=4 * 3600, check=False,
+        cwd=WORKSPACE_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    if run.returncode:
-        raise RuntimeError((run.stderr or run.stdout or "Detector failed").strip()[-2000:])
-    result = json.loads(run.stdout)
+    with backlog_runtime_lock:
+        backlog_detector_processes[_job["id"]] = process
+    try:
+        stdout_bytes, stderr_bytes = process.communicate(timeout=4 * 3600)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        process.communicate()
+        raise RuntimeError("Censorship detector timed out after 4 hours") from exc
+    finally:
+        with backlog_runtime_lock:
+            if backlog_detector_processes.get(_job["id"]) is process:
+                backlog_detector_processes.pop(_job["id"], None)
+    stdout = _decode_detector_output(stdout_bytes)
+    # ONNX Runtime writes some Windows warnings as UTF-16LE even though the
+    # Python process uses UTF-8. Removing the interleaved NULs keeps the useful
+    # diagnostic readable; strip terminal color codes before saving it.
+    stderr = _decode_detector_output(stderr_bytes)
+    if process.returncode:
+        raise RuntimeError((stderr or stdout or "Detector failed").strip()[-2000:])
+    result = json.loads(stdout)
     app.logger.info("Censorship check: %s", ", ".join(result["detected_methods"]) or "no detection")
     return result
 
@@ -1360,6 +1600,7 @@ library_backlog = LibraryBacklog(
     require_source_registration=True,
     backup_callback=_configured_backup_offload(),
     require_backup_offload=True,
+    cancel_callback=_cancel_backlog_work,
 )
 
 
@@ -1452,6 +1693,9 @@ def control_library_queue(action):
             library_backlog.pause_queue()
         elif action == 'stop':
             library_backlog.stop_queue()
+        elif action == 'cancel-current':
+            job = library_backlog.cancel_current_book()
+            return jsonify({"success": True, "source_path": job["source_path"]})
         else:
             raise ValueError(f"Invalid queue action: {action}")
         return jsonify({"success": True, "retried": retried})
@@ -1972,29 +2216,7 @@ def cancel_job(session_id):
         return jsonify({"error": "Session not found"}), 404
     
     try:
-        if process_status[session_id] == "processing":
-            job_log(session_id, 'CANCEL', 'Cancellation requested by user')
-            process_status[session_id] = "cancelled"
-
-            running_process = active_processes.get(session_id)
-            if running_process and running_process.poll() is None:
-                try:
-                    parent = psutil.Process(running_process.pid)
-                    children = parent.children(recursive=True)
-                    for child in children:
-                        child.terminate()
-                    parent.terminate()
-                    _, alive = psutil.wait_procs([*children, parent], timeout=3)
-                    for remaining in alive:
-                        remaining.kill()
-                    job_log(
-                        session_id,
-                        'CANCEL',
-                        f"Stopped subprocess tree rooted at PID {running_process.pid}",
-                    )
-                except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-                    job_log(session_id, 'CANCEL', f"Process stop warning: {exc}")
-            
+        if _cancel_processing_session(session_id):
             return jsonify({
                 "success": True,
                 "message": "Job cancelled successfully"
@@ -2002,7 +2224,7 @@ def cancel_job(session_id):
         else:
             return jsonify({
                 "success": False,
-                "message": f"Job is not in a cancellable state. Current status: {process_status[session_id]}"
+                "message": "Job is not cancellable because it is not processing or is already finalizing"
             }), 400
     except Exception as e:
         app.logger.error(f"Error cancelling job: {e}")

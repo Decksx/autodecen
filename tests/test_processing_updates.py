@@ -20,6 +20,55 @@ from scripts import process_cbz
 
 
 class ProcessingUpdateTests(unittest.TestCase):
+    def test_backlog_cancel_current_endpoint_returns_selected_source(self):
+        source_path = r"Z:\comics\Comix\Series\Book.cbz"
+        with mock.patch.object(
+            api.library_backlog,
+            'cancel_current_book',
+            return_value={'source_path': source_path},
+        ) as cancel:
+            response = api.app.test_client().post(
+                '/api/library-backlog/queue/cancel-current',
+                headers={'Origin': 'http://localhost:3000'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['source_path'], source_path)
+        cancel.assert_called_once_with()
+
+    def test_cancelled_processing_is_recorded_without_an_error_traceback(self):
+        session_id = 'cancelled-processing-test'
+        api.process_status[session_id] = 'cancelled'
+        api.process_logs[session_id] = queue.Queue()
+        with tempfile.TemporaryDirectory() as upload_dir, mock.patch.object(
+            api,
+            'process_images',
+            side_effect=api.ProcessingCancelled('cancelled by test'),
+        ):
+            api.process_images_thread([], ['black_bars'], session_id, upload_dir)
+
+        messages = []
+        while not api.process_logs[session_id].empty():
+            messages.append(api.process_logs[session_id].get())
+        self.assertEqual(api.process_status[session_id], 'cancelled')
+        self.assertTrue(any('[CANCEL]' in message for message in messages))
+        self.assertFalse(any('[ERROR]' in message for message in messages))
+
+    def test_detector_output_decoder_removes_utf16_nuls_and_terminal_colors(self):
+        warning = (
+            "\x1b[0;93m[W:onnxruntime:Default, upsamplebase.h:178 "
+            "onnxruntime::UpsampleBase::UpsampleBase] `tf_half_pixel_for_nn` "
+            "is deprecated\x1b[m\n"
+        )
+        payload = warning.encode("utf-16-le") + b"Censorship check failed on 014.jpg\n"
+
+        decoded = api._decode_detector_output(payload)
+
+        self.assertNotIn("\x00", decoded)
+        self.assertNotIn("\x1b", decoded)
+        self.assertNotIn("tf_half_pixel_for_nn", decoded)
+        self.assertIn("Censorship check failed on 014.jpg", decoded)
+
     def test_successful_backup_offload_accepts_missing_command_output(self):
         completed = mock.Mock(returncode=0, stdout=None, stderr=None)
         with mock.patch.object(api.os.path, 'isfile', return_value=True), \
@@ -240,6 +289,114 @@ class ProcessingUpdateTests(unittest.TestCase):
         self.assertEqual([call[1] for call in calls], ['black_bars', 'transparent_black'])
         self.assertEqual(calls[1][0], [calls[0][0][0].replace('source.png', '1.png')])
         self.assertEqual(results[0]['filename'], 'page.png')
+
+    def test_detected_page_plan_runs_only_one_method_per_assigned_page(self):
+        session_id = 'targeted-sequence-test'
+        api.process_status[session_id] = 'processing'
+        api.process_logs[session_id] = queue.Queue()
+        calls = []
+
+        def fake_pass(paths, model_type, _session, number, count, work_dir):
+            calls.append((list(paths), model_type, number, count))
+            results = []
+            for index, _path in enumerate(paths):
+                output = os.path.join(work_dir, f'{model_type}-{index}.png')
+                Path(output).write_bytes(b'output')
+                results.append({'filename': Path(output).name, 'processed_path': output})
+            return results
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            sources = []
+            for name in ('black.png', 'white.png', 'unchanged.png'):
+                path = os.path.join(work_dir, name)
+                Path(path).write_bytes(b'input')
+                sources.append(path)
+            with mock.patch.object(api, '_validate_runtime_files'), mock.patch.object(
+                api, '_run_model_pass', side_effect=fake_pass
+            ):
+                _, results = api.process_images(
+                    sources,
+                    ['black_bars', 'white_bars', 'mosaic'],
+                    session_id,
+                    work_dir,
+                    page_method_sequence=['black_bars', 'white_bars', None],
+                )
+
+        self.assertEqual([call[1] for call in calls], ['black_bars', 'white_bars'])
+        self.assertEqual(calls[0][0], [sources[0]])
+        self.assertEqual(calls[1][0], [sources[1]])
+        self.assertIsNone(results[2]['processed_path'])
+        self.assertNotIn('mosaic', [call[1] for call in calls])
+
+    def test_targeted_rebuild_preserves_unassigned_page_bytes(self):
+        with tempfile.TemporaryDirectory() as work_dir:
+            source = Path(work_dir) / 'Book.cbz'
+            first = io.BytesIO()
+            second = io.BytesIO()
+            Image.new('RGB', (8, 8), 'red').save(first, format='PNG')
+            Image.new('RGB', (8, 8), 'blue').save(second, format='PNG')
+            with zipfile.ZipFile(source, 'w') as archive:
+                archive.writestr('001.png', first.getvalue())
+                archive.writestr('002.png', second.getvalue())
+            extracted, details = api.extract_cbz_images(
+                str(source), str(Path(work_dir) / 'stage'), set()
+            )
+            processed = Path(work_dir) / 'processed.png'
+            Image.new('RGB', (8, 8), 'green').save(processed, format='PNG')
+            rebuilt = Path(work_dir) / 'rebuilt.cbz'
+
+            api._copy_archive_with_processed_pages(
+                str(source),
+                str(rebuilt),
+                [
+                    {'filename': Path(extracted[0]).name, 'processed_path': str(processed)},
+                    {'filename': Path(extracted[1]).name, 'processed_path': None},
+                ],
+                details['page_member_indices'],
+            )
+
+            with zipfile.ZipFile(rebuilt) as archive:
+                self.assertNotEqual(archive.read('001.png'), first.getvalue())
+                self.assertEqual(archive.read('002.png'), second.getvalue())
+            self.assertEqual(details['page_member_names'], ['001.png', '002.png'])
+
+    def test_sync_archive_converts_detected_page_names_into_targeted_plan(self):
+        captured = {}
+        with tempfile.TemporaryDirectory() as work_dir:
+            comix_root = Path(work_dir) / 'Comix'
+            source = comix_root / 'Series' / 'Book.cbz'
+            source.parent.mkdir(parents=True)
+            page = io.BytesIO()
+            Image.new('RGB', (8, 8), 'white').save(page, format='PNG')
+            with zipfile.ZipFile(source, 'w') as archive:
+                archive.writestr('pages/001.png', page.getvalue())
+                archive.writestr('pages/002.png', page.getvalue())
+
+            def fake_pipeline(paths, models, session_id, _upload, _context,
+                              page_method_sequence=None):
+                captured['paths'] = paths
+                captured['models'] = models
+                captured['page_method_sequence'] = page_method_sequence
+                api.app.config[f'archive_{session_id}'] = {'path': str(source)}
+                api.process_status[session_id] = 'completed'
+
+            with mock.patch.object(api, 'process_images_thread', side_effect=fake_pipeline):
+                api.process_cbz_archive_sync(
+                    source,
+                    model_types=['black_bars', 'mosaic'],
+                    output_mode='replace',
+                    backup_dir=Path(work_dir) / 'backups',
+                    destination_dir=comix_root,
+                    page_methods={
+                        'black_bars': ['pages/001.png'],
+                        'transparent_black': [],
+                        'white_bars': [],
+                        'mosaic': ['pages/002.png'],
+                    },
+                )
+
+        self.assertEqual(captured['models'], ['black_bars'])
+        self.assertEqual(captured['page_method_sequence'], ['black_bars', None])
 
     def test_failed_pass_is_logged_with_its_sequence_position(self):
         session_id = 'sequence-failure-test'

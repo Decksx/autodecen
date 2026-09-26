@@ -205,7 +205,7 @@ export async function controlLibraryScan(
     await backlogRequest(`/scan/${scanId}/${action}`, { method: 'POST' });
 }
 
-export async function controlLibraryQueue(action: 'pause' | 'resume' | 'stop'): Promise<void> {
+export async function controlLibraryQueue(action: 'pause' | 'resume' | 'stop' | 'cancel-current'): Promise<void> {
     await backlogRequest(`/queue/${action}`, { method: 'POST' });
 }
 

@@ -78,6 +78,35 @@ def test_rebuild_preserves_paths_metadata_and_non_image_members(tmp_path, monkey
             assert image.getpixel((0, 0))[1] > image.getpixel((0, 0))[0]
 
 
+def test_rebuild_keeps_unassigned_page_bytes_unchanged(tmp_path):
+    source = tmp_path / "Book.cbz"
+    first = _image_bytes("PNG", (255, 0, 0))
+    second = _image_bytes("PNG", (0, 0, 255))
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("001.png", first)
+        archive.writestr("002.png", second)
+
+    stage = tmp_path / "stage"
+    extracted, details = api.extract_cbz_images(str(source), str(stage), set())
+    processed = tmp_path / "processed.png"
+    processed.write_bytes(_image_bytes("PNG", (0, 255, 0)))
+    rebuilt = tmp_path / "rebuilt.cbz"
+    api._copy_archive_with_processed_pages(
+        str(source),
+        str(rebuilt),
+        [
+            {"filename": "001.png", "processed_path": str(processed)},
+            {"filename": "002.png", "processed_path": None},
+        ],
+        details["page_member_indices"],
+    )
+
+    with zipfile.ZipFile(rebuilt) as archive:
+        assert archive.read("002.png") == second
+        assert archive.read("001.png") != first
+    assert details["page_member_names"] == ["001.png", "002.png"]
+
+
 def test_output_root_mirrors_directories_and_can_preserve_filename(tmp_path, monkeypatch):
     source = tmp_path / "incoming" / "Series" / "Book.cbz"
     source.parent.mkdir(parents=True)

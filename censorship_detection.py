@@ -14,13 +14,16 @@ import io
 import json
 import os
 import sys
+import time
 import zipfile
 from pathlib import Path
 
 
 METHODS = ("black_bars", "transparent_black", "white_bars", "mosaic")
+BAR_METHODS = ("black_bars", "transparent_black", "white_bars")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp", ".tif", ".tiff"}
 MINIMUM_SCORE = 0.90
+TRANSIENT_FILE_RETRIES = 2
 
 
 def archive_pages(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
@@ -45,8 +48,17 @@ def reliable_region(mask, *, minimum_fraction: float = 0.0005,
     return count > 1 and bool((stats[1:, cv2.CC_STAT_AREA] >= required).any())
 
 
+def choose_page_method(methods) -> str | None:
+    """Choose at most one treatment for a page using pipeline priority."""
+    found = set(methods)
+    unknown = found.difference(METHODS)
+    if unknown:
+        raise ValueError(f"Detector returned unknown type(s): {', '.join(sorted(unknown))}")
+    return next((method for method in METHODS if method in found), None)
+
+
 def classify_detection(pixels, detection: dict) -> set[str]:
-    """Assign one type per high-confidence detector region on a page."""
+    """Assign at most one type to a page from its high-confidence regions."""
     import numpy as np
 
     found: set[str] = set()
@@ -63,12 +75,15 @@ def classify_detection(pixels, detection: dict) -> set[str]:
             # Median resists anti-aliased borders and underlying line art.
             luminance = float(np.median(np.asarray(pixels)[mask].mean(axis=1)))
             if luminance <= 64:
-                found.add("black_bars")
+                # Black bars have highest priority. Once one is reliable,
+                # no other treatment should be selected for this page.
+                return {"black_bars"}
             elif luminance >= 192:
                 found.add("white_bars")
             else:
                 found.add("transparent_black")
-    return found
+    selected = choose_page_method(found)
+    return {selected} if selected else set()
 
 
 def load_classifier(aletheia_root: Path):
@@ -99,18 +114,47 @@ def inspect_archive(path: str, classifier) -> dict:
     with zipfile.ZipFile(path) as archive:
         pages = archive_pages(archive)
         for index, member in enumerate(pages, start=1):
-            try:
-                found = classifier(archive.read(member))
-            except Exception as exc:
-                raise RuntimeError(f"Censorship check failed on {member.filename}: {exc}") from exc
-            if not set(found).issubset(METHODS):
-                raise ValueError(f"Detector returned an unknown type for {member.filename}")
-            for method in found:
-                pages_by_method[method].append(member.filename)
+            payload = archive.read(member)
+            for attempt in range(TRANSIENT_FILE_RETRIES + 1):
+                try:
+                    found = classifier(payload)
+                    break
+                except OSError as exc:
+                    if exc.errno != 2 or attempt == TRANSIENT_FILE_RETRIES:
+                        raise RuntimeError(
+                            f"Censorship check failed on {member.filename}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    print(
+                        f"Transient detector file error on {member.filename}; "
+                        f"retrying ({attempt + 1}/{TRANSIENT_FILE_RETRIES})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(0.25 * (attempt + 1))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Censorship check failed on {member.filename}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+            selected = choose_page_method(found)
+            if selected:
+                pages_by_method[selected].append(member.filename)
             if index == 1 or index == len(pages) or index % 25 == 0:
                 print(f"Checked {index}/{len(pages)} pages", file=sys.stderr, flush=True)
-    return {"page_count": len(pages), "pages_by_method": pages_by_method,
-            "detected_methods": [method for method in METHODS if pages_by_method[method]]}
+    # Bar censorship and mosaic censorship very rarely coexist within one
+    # book. Prefer the bar plan when either is reported so the automatic queue
+    # does not run an unnecessary mosaic restoration pass. A manual queue can
+    # still explicitly run mosaic (or every method) across the whole archive.
+    mosaic_skipped_due_to_bar = any(pages_by_method[method] for method in BAR_METHODS)
+    if mosaic_skipped_due_to_bar:
+        pages_by_method["mosaic"] = []
+    return {
+        "page_count": len(pages),
+        "pages_by_method": pages_by_method,
+        "detected_methods": [method for method in METHODS if pages_by_method[method]],
+        "mosaic_skipped_due_to_bar": mosaic_skipped_due_to_bar,
+    }
 
 
 def main(argv=None) -> int:

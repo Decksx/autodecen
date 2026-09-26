@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import json
+import threading
 import time
 import unittest
 import zipfile
@@ -19,6 +20,7 @@ from library_backlog import (
     excluded_library_path,
     format_elapsed_duration,
     inspect_cbz_eligibility,
+    normalize_detection_result,
     pending_decensor_methods,
     processing_window_status,
 )
@@ -34,6 +36,27 @@ def make_cbz(path: Path, comicinfo: str | None = None) -> None:
 
 
 class LibraryBacklogTests(unittest.TestCase):
+    def test_detection_plan_assigns_one_method_per_page_and_prefers_bars(self):
+        result = normalize_detection_result({
+            "page_count": 3,
+            "pages_by_method": {
+                "black_bars": ["001.jpg"],
+                "transparent_black": ["001.jpg", "002.jpg"],
+                "white_bars": ["002.jpg"],
+                "mosaic": ["001.jpg", "003.jpg"],
+            },
+            "detected_methods": [
+                "black_bars", "transparent_black", "white_bars", "mosaic"
+            ],
+        })
+
+        self.assertEqual(result["pages_by_method"]["black_bars"], ["001.jpg"])
+        self.assertEqual(result["pages_by_method"]["transparent_black"], ["002.jpg"])
+        self.assertEqual(result["pages_by_method"]["white_bars"], [])
+        self.assertEqual(result["pages_by_method"]["mosaic"], [])
+        self.assertEqual(result["detected_methods"], ["black_bars", "transparent_black"])
+        self.assertTrue(result["mosaic_skipped_due_to_bar"])
+
     def test_known_types_only_mode_is_opt_in_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state" / "backlog.sqlite3"
@@ -375,9 +398,84 @@ class LibraryBacklogTests(unittest.TestCase):
             manager.pause_queue()
             manager._queue_thread.join(timeout=2)
 
-            self.assertEqual(store.book_progress(str(missing))["state"], "failed")
+            self.assertEqual(store.book_progress(str(missing))["state"], "skipped")
             self.assertEqual(store.book_progress(str(available))["state"], "completed")
-            self.assertTrue(any(event["event_type"] == "job_failed" for event in store.snapshot()["events"]))
+            self.assertTrue(any(event["event_type"] == "job_skipped" for event in store.snapshot()["events"]))
+
+    def test_cancel_current_book_skips_it_and_continues_with_next_book(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            cancelled = root / "Cancel Me.cbz"
+            following = root / "Following.cbz"
+            make_cbz(cancelled)
+            make_cbz(following)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for archive in (cancelled, following):
+                store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+
+            processing_started = threading.Event()
+            release_processor = threading.Event()
+
+            def processor(path, sequence, _job):
+                if path == str(cancelled):
+                    processing_started.set()
+                    release_processor.wait(timeout=2)
+                    raise RuntimeError("model process terminated")
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            def cancel(_job):
+                release_processor.set()
+                return True
+
+            manager = LibraryBacklog(store, processor, cancel_callback=cancel)
+            manager.resume_queue(retry_failed=False)
+            self.assertTrue(processing_started.wait(timeout=2))
+            selected = manager.cancel_current_book()
+            self.assertEqual(selected["source_path"], str(cancelled))
+
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(following))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+
+            self.assertEqual(store.book_progress(str(cancelled))["state"], "skipped")
+            self.assertEqual(store.book_progress(str(following))["state"], "completed")
+            self.assertTrue(cancelled.exists())
+            self.assertTrue(any(event["event_type"] == "job_cancelled" for event in store.snapshot()["events"]))
+
+    def test_source_moved_during_processing_is_skipped_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            moved = root / "Moved Away.cbz"
+            following = root / "Following.cbz"
+            make_cbz(moved)
+            make_cbz(following)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for archive in (moved, following):
+                store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
+
+            def processor(path, sequence, _job):
+                if path == str(moved):
+                    moved.unlink()
+                    raise FileNotFoundError(path)
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(store, processor)
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(following))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+
+            self.assertEqual(store.book_progress(str(moved))["state"], "skipped")
+            self.assertEqual(store.book_progress(str(following))["state"], "completed")
+            self.assertEqual(store.snapshot()["counts"]["failed"], 0)
 
     def test_unavailable_root_after_claim_does_not_consume_attempt(self):
         with tempfile.TemporaryDirectory() as directory:

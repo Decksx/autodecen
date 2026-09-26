@@ -215,13 +215,19 @@ The backlog also offers an opt-in **Only process books with a detected
 censorship type** mode. Before backup or replacement, Aletheia-Lens checks
 every supported page in each queued CBZ. High-confidence bar detections are
 classified as black, white, or mid-tone/transparent by the median color under
-the detector mask; mosaic detections remain separate. Only detected, still
-pending methods run. An archive with no reliable detection is skipped for
+the detector mask; mosaic detections remain separate. Automatic processing
+assigns at most one method to each page in black-bar, transparent-bar,
+white-bar, then mosaic priority. If any bar type is found in a book, mosaic is
+suppressed for that automatic run. Only the pages assigned to a method are sent
+through that model; unaffected pages retain their original image bytes. An
+archive with no reliable detection is skipped for
 review, with its bytes and ComicInfo.xml unchanged—not labeled uncensored.
 Detector results, affected page names, count, and elapsed time are saved in
 the backlog database and reused after an interrupted job. A changed archive
 invalidates its prior result. Manually queued methods bypass the automatic
-check. The option is off by default, so an existing queue will retain its
+page plan and run each selected method across the entire book. Selecting all
+methods with the reprocess override forces a complete repeat even when method
+tags already exist. The option is off by default, so an existing queue will retain its
 current behavior until you pause it and enable the checkbox. Detection is a
 conservative filter, not proof that a book is uncensored; review skipped books
 or queue selected methods manually when a detector misses an unusual mask.
@@ -236,7 +242,13 @@ existing `ComicInfo.xml`. When metadata is absent, it creates a minimal
 fails for manual review.
 
 Pause and stop requests for the processing queue take effect at the next safe
-book boundary; Camelia does not terminate a model midway through an archive.
+book boundary. **Cancel current book** is the explicit interruption control: it
+terminates the active detector/model process, keeps the source archive
+unchanged, marks that book skipped, and lets a still-running queue continue to
+the next book. Cancellation is refused after final rebuilt-archive installation
+has begun because that short phase must remain atomic. If an archive is moved
+or deleted manually while its job is active, Camelia also marks it skipped
+instead of failed, so Resume does not repeatedly retry the missing path.
 The backlog also has an opt-in `X:\comix` batch schedule: every night from
 00:00–05:00 and Monday–Friday from 09:00–17:00 in America/Denver. Enable it in
 the Library Decensor Backlog panel after choosing/crawling `X:\comix` **and**

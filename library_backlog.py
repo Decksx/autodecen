@@ -32,11 +32,42 @@ EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".stversions", ".stfolder", "@eadir", "$recycle.bin", "system volume information",
 })
 DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars", "mosaic")
+BAR_METHODS = DEFAULT_SEQUENCE[:3]
 METHOD_TAG_PREFIX = "camelia:"
 PREVIOUS_DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars")
 ACTIVE_STATES = ("queued", "processing")
 SCHEDULE_ROOT = DEFAULT_ROOTS[0]
 SCHEDULE_TIMEZONE = ZoneInfo("America/Denver")
+
+
+def normalize_detection_result(result: dict) -> dict:
+    """Enforce one automatic treatment per page and bar-over-mosaic policy."""
+    pages = result.get("pages_by_method")
+    if not isinstance(pages, dict) or set(pages) != set(DEFAULT_SEQUENCE):
+        return result
+    normalized = {method: [] for method in DEFAULT_SEQUENCE}
+    assigned_pages = {}
+    for method in DEFAULT_SEQUENCE:
+        for name in pages[method]:
+            assigned_method = assigned_pages.get(name)
+            if assigned_method is None:
+                normalized[method].append(name)
+                assigned_pages[name] = method
+            elif assigned_method == method:
+                # Preserve duplicate archive-member occurrences assigned to
+                # the same method while still rejecting cross-method overlap.
+                normalized[method].append(name)
+    mosaic_skipped_due_to_bar = any(normalized[method] for method in BAR_METHODS)
+    if mosaic_skipped_due_to_bar:
+        normalized["mosaic"] = []
+    return {
+        **result,
+        "pages_by_method": normalized,
+        "detected_methods": [
+            method for method in DEFAULT_SEQUENCE if normalized[method]
+        ],
+        "mosaic_skipped_due_to_bar": mosaic_skipped_due_to_bar,
+    }
 
 
 def excluded_library_path(path: str, root: str, *, directory: bool = False) -> bool:
@@ -994,6 +1025,39 @@ class BacklogStore:
             )
             self._event(db, "job_skipped", reason, book_id=book_id)
 
+    def cancel_job(self, book_id: int, reason: str) -> None:
+        """Mark one claimed book skipped after its active work was cancelled."""
+        now = utc_now()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT state,started_at FROM books WHERE id=?", (book_id,)
+            ).fetchone()
+            if row is None or row["state"] != "processing":
+                raise ValueError(f"Cannot cancel book {book_id} unless it is processing")
+            db.execute(
+                """UPDATE book_stages SET state='interrupted', updated_at=?
+                   WHERE book_id=? AND state IN ('pending','running','passed')""",
+                (now, book_id),
+            )
+            db.execute(
+                """UPDATE book_phases SET state='interrupted', updated_at=?
+                   WHERE book_id=? AND state='running'""",
+                (now, book_id),
+            )
+            db.execute(
+                """UPDATE books SET state='skipped', current_stage=NULL, last_error=?,
+                   completed_at=?, duration_seconds=?, updated_at=? WHERE id=?""",
+                (reason, now, elapsed_seconds(row["started_at"], now), now, book_id),
+            )
+            self._event(db, "job_cancelled", reason, book_id=book_id)
+
+    def processing_book(self) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM books WHERE state='processing' ORDER BY started_at,id LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
     def mark_detection_started(self, book_id: int) -> None:
         with self.connect() as db:
             db.execute(
@@ -1004,6 +1068,7 @@ class BacklogStore:
 
     def save_detection(self, book_id: int, result: dict, duration_seconds: float) -> None:
         """Save a complete audit; never interpret a detector error as no censorship."""
+        result = normalize_detection_result(result)
         methods = result["detected_methods"]
         pages = result["pages_by_method"]
         count = result["page_count"]
@@ -1029,7 +1094,10 @@ class BacklogStore:
             )
             self._event(db, "censorship_detected",
                         f"Inspected {count} page(s): {', '.join(methods) if methods else 'no reliable detection'} "
-                        f"({format_elapsed_duration(duration_seconds)})", book_id=book_id)
+                        f"({format_elapsed_duration(duration_seconds)})"
+                        + ("; mosaic skipped because bar censorship was found"
+                           if result.get("mosaic_skipped_due_to_bar") else ""),
+                        book_id=book_id)
 
     def select_detected_methods(self, book_id: int, methods: Iterable[str]) -> list[str]:
         """Narrow the automatic plan without adding methods absent from the queue."""
@@ -1219,7 +1287,8 @@ class LibraryBacklog:
                  require_backup_offload: bool = False,
                  prepare_callback: Callable[[dict], object] | None = None,
                  require_source_registration: bool = False,
-                 detector: Callable[[str, dict], dict] | None = None):
+                 detector: Callable[[str, dict], dict] | None = None,
+                 cancel_callback: Callable[[dict], bool | None] | None = None):
         self.store = store
         self.processor = processor
         self.sync_callback = sync_callback
@@ -1228,9 +1297,12 @@ class LibraryBacklog:
         self.prepare_callback = prepare_callback
         self.require_source_registration = require_source_registration
         self.detector = detector
+        self.cancel_callback = cancel_callback
         self._scan_threads: dict[int, threading.Thread] = {}
         self._queue_thread: threading.Thread | None = None
         self._thread_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
+        self._cancel_book_id: int | None = None
 
     @staticmethod
     def validate_root(root: str, allowed_roots: Iterable[str] = DEFAULT_ROOTS) -> str:
@@ -1364,7 +1436,10 @@ class LibraryBacklog:
         """Return True when the queue must pause, False for one missing book."""
         root = job["root_path"]
         if isinstance(error, FileNotFoundError) and os.path.isdir(root):
-            self.store.fail_job(job["id"], f"{context}: {error}")
+            self.store.skip_job(
+                job["id"],
+                f"{context}: source was removed from the library; skipped without retry",
+            )
             return False
         reason = (
             self._unavailable_root_message(root) if not os.path.isdir(root)
@@ -1373,6 +1448,54 @@ class LibraryBacklog:
         self.store.defer_job(job["id"], reason)
         self.pause_queue()
         return True
+
+    def cancel_current_book(self) -> dict:
+        """Request safe cancellation of the currently claimed book."""
+        job = self.store.processing_book()
+        if job is None:
+            raise ValueError("No book is currently processing")
+        book_id = job["id"]
+        with self._cancel_lock:
+            if self._cancel_book_id == book_id:
+                return job
+            self._cancel_book_id = book_id
+        try:
+            if self.cancel_callback is not None and self.cancel_callback(job) is False:
+                raise ValueError(
+                    "The current book is already installing its rebuilt archive and can no longer be safely cancelled"
+                )
+            self.store.record_event(
+                "job_cancel_requested", f"Cancellation requested: {job['source_path']}"
+            )
+            return job
+        except Exception:
+            with self._cancel_lock:
+                if self._cancel_book_id == book_id:
+                    self._cancel_book_id = None
+            raise
+
+    def _cancel_requested(self, book_id: int) -> bool:
+        with self._cancel_lock:
+            return self._cancel_book_id == book_id
+
+    def _finish_cancellation(self, job: dict) -> bool:
+        with self._cancel_lock:
+            if self._cancel_book_id != job["id"]:
+                return False
+            self._cancel_book_id = None
+        self.store.cancel_job(
+            job["id"], "Cancelled by user; original archive left unchanged and book skipped",
+        )
+        return True
+
+    def _skip_if_source_removed(self, job: dict, context: str) -> bool:
+        if os.path.isdir(job["root_path"]) and not os.path.isfile(job["source_path"]):
+            self.store.skip_job(
+                job["id"],
+                f"{context}: source was removed from the library; skipped without retry",
+            )
+            return True
+        return False
 
     def set_batch_schedule(self, enabled: bool) -> None:
         """Opt-in scheduled processing; disabling never frees a running job."""
@@ -1443,6 +1566,8 @@ class LibraryBacklog:
             book_id = job["id"]
             book_started = time.perf_counter()
             sequence = json.loads(job["selected_sequence"])
+            if self._finish_cancellation(job):
+                continue
             if excluded_library_path(job["source_path"], job["root_path"]):
                 self.store.skip_job(book_id, "Refused sync/version-history path outside the active library")
                 continue
@@ -1458,12 +1583,16 @@ class LibraryBacklog:
                 self.store.fail_job(book_id, f"Source preflight failed: {exc}")
                 self.pause_queue()
                 return
+            if self._finish_cancellation(job):
+                continue
             if self.store.known_types_only() and job["auto_detect"]:
                 try:
                     if job["detected_methods"] is None:
                         self.store.mark_detection_started(book_id)
                         detection_started = time.perf_counter()
-                        detection = self.detector(job["source_path"], job)
+                        detection = normalize_detection_result(
+                            self.detector(job["source_path"], job)
+                        )
                         current = os.stat(job["source_path"])
                         if (current.st_size, current.st_mtime_ns) != (job["file_size"], job["mtime_ns"]):
                             raise RuntimeError("Source changed during censorship check")
@@ -1471,8 +1600,19 @@ class LibraryBacklog:
                             book_id, detection, time.perf_counter() - detection_started
                         )
                         detected_methods = detection["detected_methods"]
+                        job["detected_methods"] = json.dumps(detected_methods)
+                        job["detected_pages"] = json.dumps(detection["pages_by_method"])
                     else:
-                        detected_methods = json.loads(job["detected_methods"])
+                        detection = normalize_detection_result({
+                            "page_count": job["detection_page_count"],
+                            "pages_by_method": json.loads(job["detected_pages"]),
+                            "detected_methods": json.loads(job["detected_methods"]),
+                        })
+                        detected_methods = detection["detected_methods"]
+                        job["detected_methods"] = json.dumps(detected_methods)
+                        job["detected_pages"] = json.dumps(detection["pages_by_method"])
+                    if self._cancel_requested(book_id):
+                        raise RuntimeError("Cancellation requested")
                     sequence = self.store.select_detected_methods(book_id, detected_methods)
                     if not sequence:
                         self.store.skip_job(
@@ -1481,10 +1621,16 @@ class LibraryBacklog:
                         )
                         continue
                 except Exception as exc:
+                    if self._finish_cancellation(job):
+                        continue
+                    if self._skip_if_source_removed(job, "Source disappeared during censorship check"):
+                        continue
                     LOGGER.exception("Censorship check failed for %s", job["source_path"])
                     self.store.fail_job(book_id, f"Censorship check failed: {type(exc).__name__}: {exc}")
                     self.pause_queue()
                     return
+            if self._finish_cancellation(job):
+                continue
             if self.backup_callback is not None:
                 try:
                     self.backup_callback(job, None)
@@ -1492,6 +1638,8 @@ class LibraryBacklog:
                     self.store.fail_job(book_id, f"Backup preflight failed: {exc}")
                     self.pause_queue()
                     return
+            if self._finish_cancellation(job):
+                continue
             if self.prepare_callback is not None and job["root_path"].casefold() == SCHEDULE_ROOT.casefold():
                 try:
                     self.prepare_callback(job)
@@ -1499,6 +1647,8 @@ class LibraryBacklog:
                     self.store.fail_job(book_id, f"ComicAutomation source registration failed: {exc}")
                     self.pause_queue()
                     return
+            if self._finish_cancellation(job):
+                continue
             try:
                 current = os.stat(job["source_path"])
                 if (current.st_size, current.st_mtime_ns) != (job["file_size"], job["mtime_ns"]):
@@ -1515,6 +1665,8 @@ class LibraryBacklog:
                 for index, stage in enumerate(sequence, start=1):
                     self.store.update_stage(book_id, stage, "stage_pending", f"Stage {index}/{len(sequence)} queued: {stage}")
                 result = self.processor(job["source_path"], sequence, job)
+                if self._cancel_requested(book_id):
+                    raise RuntimeError("Cancellation requested")
                 output_path = result["path"] if isinstance(result, dict) else str(result)
                 inspection = inspect_cbz_eligibility(output_path)
                 if not inspection["already_processed"]:
@@ -1525,6 +1677,10 @@ class LibraryBacklog:
                     book_id, output_path, time.perf_counter() - book_started
                 )
             except Exception as exc:  # worker boundary: persist every failure
+                if self._finish_cancellation(job):
+                    continue
+                if self._skip_if_source_removed(job, "Source disappeared during processing"):
+                    continue
                 LOGGER.exception("Backlog job failed for %s", job["source_path"])
                 self.store.fail_job(book_id, f"{type(exc).__name__}: {exc}")
             else:
