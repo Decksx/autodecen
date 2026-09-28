@@ -153,6 +153,8 @@ export interface LibraryBookProgress {
     detection_checked_at: string | null;
     detection_duration_seconds: number | null;
     detection_page_count: number | null;
+    archive_page_count: number | null;
+    series_path: string | null;
     selected_sequence: ProcessingType[];
     stages: Array<{
         stage: ProcessingType;

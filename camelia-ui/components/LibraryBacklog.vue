@@ -65,6 +65,10 @@
                 Cancel current book stops its active detector/model process, leaves the source archive unchanged,
                 and marks that book skipped. Cancellation is disabled once rebuilt-archive installation begins.
             </p>
+            <p class="text-xs text-subtle">
+                Queue priority: books over 350 pages and series folders containing more than 6 books wait until
+                all ordinary queued books are finished. Original FIFO order is preserved within each group.
+            </p>
             <p v-if="actionError" class="text-sm text-love">{{ actionError }}</p>
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm text-text">

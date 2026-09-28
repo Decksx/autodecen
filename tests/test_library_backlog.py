@@ -26,16 +26,93 @@ from library_backlog import (
 )
 
 
-def make_cbz(path: Path, comicinfo: str | None = None) -> None:
+def make_cbz(path: Path, comicinfo: str | None = None, *, page_count: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("001.jpg", b"not-read-by-metadata-inspection")
+        for page in range(1, page_count + 1):
+            archive.writestr(f"{page:03}.jpg", b"not-read-by-metadata-inspection")
         archive.writestr("extras/note.txt", b"preserve me")
         if comicinfo is not None:
             archive.writestr("metadata/ComicInfo.xml", comicinfo.encode("utf-8"))
 
 
 class LibraryBacklogTests(unittest.TestCase):
+    def test_discovery_counts_image_pages_without_counting_auxiliary_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "Book.cbz"
+            make_cbz(archive, page_count=3)
+
+            inspection = inspect_cbz_eligibility(str(archive))
+
+            self.assertEqual(inspection["page_count"], 3)
+
+    def test_large_book_is_claimed_after_ordinary_book_including_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            large = root / "Large Series" / "Large.cbz"
+            ordinary = root / "Short Series" / "Short.cbz"
+            make_cbz(large, page_count=351)
+            make_cbz(ordinary, page_count=2)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for archive in (large, ordinary):
+                store.record_archive(
+                    scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility
+                )
+            # Simulate an existing database whose page counts predate this feature.
+            with store.connect() as db:
+                db.execute("UPDATE books SET archive_page_count=NULL")
+
+            self.assertEqual(store.claim_job()["source_path"], str(ordinary))
+            self.assertEqual(store.claim_job()["source_path"], str(large))
+
+    def test_series_with_more_than_six_books_is_claimed_after_small_series(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            large_series = root / "Seven Books"
+            ordinary = root / "One Book" / "Only.cbz"
+            series_books = [large_series / f"Book {number}.cbz" for number in range(1, 8)]
+            for archive in series_books:
+                make_cbz(archive)
+            make_cbz(ordinary)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for archive in (*series_books, ordinary):
+                store.record_archive(
+                    scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility
+                )
+
+            self.assertEqual(store.claim_job()["source_path"], str(ordinary))
+            self.assertEqual(store.claim_job()["source_path"], str(series_books[0]))
+
+    def test_existing_database_migrates_queue_priority_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Series" / "Book.cbz"
+            make_cbz(archive)
+            database = Path(directory) / "state" / "backlog.sqlite3"
+            store = BacklogStore(str(database))
+            scan_id = store.start_scan(str(root))
+            store.record_archive(
+                scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility
+            )
+            with store.connect() as db:
+                db.execute("DROP INDEX books_series_idx")
+                db.execute("ALTER TABLE books DROP COLUMN archive_page_count")
+                db.execute("ALTER TABLE books DROP COLUMN series_path")
+
+            migrated = BacklogStore(str(database))
+            with migrated.connect() as db:
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(books)")}
+                row = db.execute(
+                    "SELECT archive_page_count,series_path FROM books WHERE source_path=?",
+                    (str(archive),),
+                ).fetchone()
+            self.assertIn("archive_page_count", columns)
+            self.assertIn("series_path", columns)
+            self.assertIsNone(row["archive_page_count"])
+            self.assertEqual(row["series_path"], str(archive.parent))
+
     def test_detection_plan_assigns_one_method_per_page_and_prefers_bars(self):
         result = normalize_detection_result({
             "page_count": 3,

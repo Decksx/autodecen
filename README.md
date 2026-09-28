@@ -202,6 +202,13 @@ gain an `eligibility_version` column automatically; previously scanned rows are
 reclassified once under the method-aware policy, then return to fingerprint
 reuse. The UI can manually queue one previously crawled book with selected
 methods and an explicit reprocess override.
+Queue selection uses two FIFO tiers so short work is not trapped behind unusually
+large batches. Books with more than 350 supported image pages, and every book in
+a series directory containing more than 6 known CBZs, run only after all ordinary
+queued books. The crawler records page counts from ZIP directory metadata without
+extracting or decoding images. Existing database rows are classified lazily before
+the queue claims any deferred work, so upgrading does not require rebuilding the
+backlog database.
 The crawl excludes sync and system history directories (`.stversions`,
 `.stfolder`, `@eaDir`, `$RECYCLE.BIN`, and `System Volume Information`),
 including directories retained by an older checkpoint. A previously queued

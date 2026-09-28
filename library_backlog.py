@@ -33,6 +33,10 @@ EXCLUDED_DIRECTORY_NAMES = frozenset({
 })
 DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars", "mosaic")
 BAR_METHODS = DEFAULT_SEQUENCE[:3]
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp", ".tif", ".tiff"})
+QUEUE_PRIORITY_VERSION = 3
+DEFER_PAGE_COUNT = 350
+DEFER_SERIES_BOOK_COUNT = 6
 METHOD_TAG_PREFIX = "camelia:"
 PREVIOUS_DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars")
 ACTIVE_STATES = ("queued", "processing")
@@ -156,8 +160,22 @@ def _comicinfo_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo | None:
     return None
 
 
+def _archive_page_count(archive: zipfile.ZipFile) -> int:
+    """Count supported image members from ZIP metadata without extracting them."""
+    return sum(
+        1 for member in archive.infolist()
+        if not member.is_dir() and Path(member.filename).suffix.casefold() in IMAGE_EXTENSIONS
+    )
+
+
+def inspect_cbz_page_count(path: str) -> int:
+    """Read only a CBZ central directory and return its image-page count."""
+    with zipfile.ZipFile(path) as archive:
+        return _archive_page_count(archive)
+
+
 def inspect_cbz_eligibility(path: str) -> dict:
-    """Read only filename and ComicInfo.xml to classify one CBZ.
+    """Read ZIP metadata and ComicInfo.xml to classify one CBZ.
 
     Image members are never extracted. Malformed/missing ComicInfo metadata is
     logged in the result but does not make an otherwise unmarked book unsafe to
@@ -170,6 +188,7 @@ def inspect_cbz_eligibility(path: str) -> dict:
         "tags": [],
         "applied_methods": [],
         "comicinfo_member": None,
+        "page_count": None,
         "parse_error": None,
         "reason": "No uncensored/decensored marker found",
     }
@@ -180,6 +199,7 @@ def inspect_cbz_eligibility(path: str) -> dict:
 
     try:
         with zipfile.ZipFile(path) as archive:
+            result["page_count"] = _archive_page_count(archive)
             member = _comicinfo_member(archive)
             if member is None:
                 if not filename_marked:
@@ -417,6 +437,8 @@ class BacklogStore:
                     detection_checked_at TEXT,
                     detection_duration_seconds REAL,
                     detection_page_count INTEGER,
+                    archive_page_count INTEGER,
+                    series_path TEXT,
                     state TEXT NOT NULL,
                     selected_sequence TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -485,9 +507,22 @@ class BacklogStore:
                 ("detection_checked_at", "TEXT"),
                 ("detection_duration_seconds", "REAL"),
                 ("detection_page_count", "INTEGER"),
+                ("archive_page_count", "INTEGER"),
+                ("series_path", "TEXT"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE books ADD COLUMN {name} {definition}")
+            # Add the index only after migrating existing databases, then
+            # cheaply populate directory identity for old rows. Page counts
+            # are filled lazily.
+            db.execute("CREATE INDEX IF NOT EXISTS books_series_idx ON books(root_path, series_path)")
+            missing_series = db.execute(
+                "SELECT id,source_path FROM books WHERE series_path IS NULL OR series_path=''"
+            ).fetchall()
+            db.executemany(
+                "UPDATE books SET series_path=? WHERE id=?",
+                [(os.path.dirname(row["source_path"]), row["id"]) for row in missing_series],
+            )
             stage_columns = {row["name"] for row in db.execute("PRAGMA table_info(book_stages)")}
             if "duration_seconds" not in stage_columns:
                 db.execute("ALTER TABLE book_stages ADD COLUMN duration_seconds REAL")
@@ -648,7 +683,7 @@ class BacklogStore:
         now = utc_now()
         with self.connect() as db:
             prior = db.execute("SELECT * FROM books WHERE source_path=?", (normalized,)).fetchone()
-            unchanged = (prior and prior["eligibility_version"] >= 2
+            unchanged = (prior and prior["eligibility_version"] >= QUEUE_PRIORITY_VERSION
                          and prior["file_size"] == stat.st_size and prior["mtime_ns"] == stat.st_mtime_ns)
             if unchanged:
                 db.execute("UPDATE books SET last_scan_id=?, updated_at=? WHERE id=?", (scan_id, now, prior["id"]))
@@ -674,7 +709,7 @@ class BacklogStore:
                 inspection.get("title"), json.dumps(inspection.get("tags", [])),
                 reason, state, json.dumps(sequence),
                 now if state == "queued" else None, inspection.get("parse_error"), now,
-                normalized,
+                inspection.get("page_count"), os.path.dirname(normalized), normalized,
             )
             if prior:
                 # The bytes changed; pass markers from the old archive can no
@@ -684,25 +719,27 @@ class BacklogStore:
                     """UPDATE books SET root_path=?, last_scan_id=?, file_size=?, mtime_ns=?,
                        metadata_title=?, metadata_tags=?, eligibility_reason=?, state=?,
                        selected_sequence=?, attempts=0, current_stage=NULL, queued_at=?,
-                       last_error=?, completed_at=NULL, updated_at=?, eligibility_version=2,
+                       last_error=?, completed_at=NULL, updated_at=?, eligibility_version=?,
                        auto_detect=1, detected_methods=NULL, detected_pages=NULL,
                        detection_checked_at=NULL, detection_duration_seconds=NULL,
-                       detection_page_count=NULL WHERE source_path=?""",
-                    values,
+                       detection_page_count=NULL, archive_page_count=?, series_path=?
+                       WHERE source_path=?""",
+                    (*values[:12], QUEUE_PRIORITY_VERSION, *values[12:]),
                 )
                 book_id = prior["id"]
             else:
                 cursor = db.execute(
                     """INSERT INTO books(source_path,root_path,last_scan_id,file_size,mtime_ns,
                        metadata_title,metadata_tags,eligibility_reason,state,selected_sequence,
-                       eligibility_version,
-                       queued_at,last_error,discovered_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       eligibility_version,queued_at,last_error,discovered_at,updated_at,
+                       archive_page_count,series_path)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         normalized, root, scan_id, stat.st_size, stat.st_mtime_ns,
                         inspection.get("title"), json.dumps(inspection.get("tags", [])),
-                        reason, state, json.dumps(sequence), 2,
+                        reason, state, json.dumps(sequence), QUEUE_PRIORITY_VERSION,
                         now if state == "queued" else None, inspection.get("parse_error"), now, now,
+                        inspection.get("page_count"), os.path.dirname(normalized),
                     ),
                 )
                 book_id = cursor.lastrowid
@@ -816,23 +853,73 @@ class BacklogStore:
 
     def claim_job(self, root_path: str | None = None,
                   exclude_root: str | None = None) -> dict | None:
-        with self._lock, self.connect() as db:
-            row = db.execute(
-                """SELECT * FROM books WHERE state='queued' AND attempts <= max_retries
+        parameters = (root_path, root_path, exclude_root, exclude_root)
+        scope = """state='queued' AND attempts <= max_retries
                    AND (? IS NULL OR root_path = ? COLLATE NOCASE)
-                   AND (? IS NULL OR root_path <> ? COLLATE NOCASE)
-                   ORDER BY queued_at, id LIMIT 1""",
-                (root_path, root_path, exclude_root, exclude_root),
-            ).fetchone()
-            if not row:
-                return None
-            now = utc_now()
-            db.execute(
-                "UPDATE books SET state='processing', attempts=attempts+1, started_at=?, completed_at=NULL, duration_seconds=NULL, updated_at=?, current_stage='starting' WHERE id=? AND state='queued'",
-                (now, now, row["id"]),
-            )
-            self._event(db, "job_start", f"Processing started: {row['source_path']}", book_id=row["id"])
-            return dict(db.execute("SELECT * FROM books WHERE id=?", (row["id"],)).fetchone())
+                   AND (? IS NULL OR root_path <> ? COLLATE NOCASE)"""
+        series_size = """(SELECT COUNT(*) FROM books AS related
+                            WHERE related.root_path = books.root_path COLLATE NOCASE
+                              AND related.series_path = books.series_path COLLATE NOCASE)"""
+
+        while True:
+            with self._lock, self.connect() as db:
+                # Preserve FIFO within each tier. Known ordinary jobs always
+                # run before large books/series, regardless of discovery time.
+                row = db.execute(
+                    f"""SELECT * FROM books WHERE {scope}
+                       AND archive_page_count IS NOT NULL
+                       AND archive_page_count <= ? AND {series_size} <= ?
+                       ORDER BY queued_at, id LIMIT 1""",
+                    (*parameters, DEFER_PAGE_COUNT, DEFER_SERIES_BOOK_COUNT),
+                ).fetchone()
+                if row is not None:
+                    return self._claim_row(db, row)
+
+                # Databases created before queue priority metadata was added
+                # are classified from the ZIP central directory before any
+                # deferred job can start. No image is extracted or decoded.
+                unknown = db.execute(
+                    f"""SELECT id,source_path FROM books WHERE {scope}
+                       AND archive_page_count IS NULL
+                       AND {series_size} <= ?
+                       ORDER BY queued_at, id LIMIT 1""",
+                    (*parameters, DEFER_SERIES_BOOK_COUNT),
+                ).fetchone()
+                if unknown is None:
+                    deferred = db.execute(
+                        f"""SELECT * FROM books WHERE {scope}
+                           ORDER BY queued_at, id LIMIT 1""",
+                        parameters,
+                    ).fetchone()
+                    return self._claim_row(db, deferred) if deferred is not None else None
+
+            try:
+                page_count = inspect_cbz_page_count(unknown["source_path"])
+                warning = None
+            except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+                # Classification failure must not strand a valid queued job;
+                # normal processing will report any actual archive failure.
+                page_count = -1
+                warning = f"Queue priority page count unavailable: {type(exc).__name__}: {exc}"
+            with self._lock, self.connect() as db:
+                updated = db.execute(
+                    """UPDATE books SET archive_page_count=?, updated_at=?
+                       WHERE id=? AND state='queued' AND archive_page_count IS NULL""",
+                    (page_count, utc_now(), unknown["id"]),
+                )
+                if updated.rowcount and warning:
+                    self._event(db, "queue_priority_warning", warning, book_id=unknown["id"])
+
+    def _claim_row(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+        now = utc_now()
+        db.execute(
+            """UPDATE books SET state='processing', attempts=attempts+1, started_at=?,
+               completed_at=NULL, duration_seconds=NULL, updated_at=?, current_stage='starting'
+               WHERE id=? AND state='queued'""",
+            (now, now, row["id"]),
+        )
+        self._event(db, "job_start", f"Processing started: {row['source_path']}", book_id=row["id"])
+        return dict(db.execute("SELECT * FROM books WHERE id=?", (row["id"],)).fetchone())
 
     def update_stage(self, book_id: int, stage: str, event: str, message: str,
                      duration_seconds: float | None = None) -> None:
@@ -1203,6 +1290,7 @@ class BacklogStore:
                 "last_error", "started_at", "completed_at", "duration_seconds", "updated_at",
                 "auto_detect", "detected_methods", "detected_pages", "detection_checked_at",
                 "detection_duration_seconds", "detection_page_count",
+                "archive_page_count", "series_path",
             )}
             item["detected_methods"] = json.loads(item["detected_methods"]) if item["detected_methods"] else None
             detected_pages = json.loads(item["detected_pages"]) if item["detected_pages"] else None
