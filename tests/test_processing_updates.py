@@ -20,6 +20,34 @@ from scripts import process_cbz
 
 
 class ProcessingUpdateTests(unittest.TestCase):
+    def test_mixed_extensions_cannot_overwrite_same_stem_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            png = root / '001.png'
+            jpg = root / '001.jpg'
+            png.write_bytes(b'first opaque input')
+            jpg.write_bytes(b'second opaque input')
+
+            def fake_process(command, **_options):
+                inputs = Path(command[command.index('--input_dir') + 1]) / 'black_bars'
+                outputs = Path(command[command.index('--output_dir') + 1])
+                for path in inputs.iterdir():
+                    (outputs / (path.stem + '.png')).write_bytes(path.read_bytes())
+                process = mock.Mock()
+                process.stdout = io.StringIO('')
+                process.wait.return_value = 0
+                return process
+
+            with mock.patch.object(api.subprocess, 'Popen', side_effect=fake_process):
+                results = api._run_model_pass(
+                    [str(png), str(jpg)], 'black_bars', 'name-collision-test', 1, 1,
+                    str(root / 'work'),
+                )
+            self.assertEqual(len(results), 2)
+            self.assertEqual([Path(r['processed_path']).read_bytes() for r in results],
+                             [b'first opaque input', b'second opaque input'])
+            self.assertNotEqual(results[0]['processed_path'], results[1]['processed_path'])
+
     def test_backlog_cancel_current_endpoint_returns_selected_source(self):
         source_path = r"Z:\comics\Comix\Series\Book.cbz"
         with mock.patch.object(

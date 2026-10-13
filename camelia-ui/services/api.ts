@@ -123,7 +123,7 @@ export interface LibraryBacklogStatus {
         window_ends_at: string | null;
         next_window_at: string | null;
     };
-    counts: Record<'discovered' | 'eligible' | 'queued' | 'processing' | 'completed' | 'failed' | 'skipped', number>;
+    counts: Record<'discovered' | 'eligible' | 'queued' | 'processing' | 'completed' | 'failed' | 'quarantined' | 'skipped', number>;
     current_file: string | null;
     current_stage: string | null;
     recent_books: LibraryBookProgress[];

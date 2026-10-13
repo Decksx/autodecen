@@ -22,6 +22,7 @@ from library_backlog import (
     inspect_cbz_eligibility,
     normalize_detection_result,
     pending_decensor_methods,
+    processing_issue_destination,
     processing_window_status,
 )
 
@@ -254,7 +255,66 @@ class LibraryBacklogTests(unittest.TestCase):
             self.assertEqual(calls, [["black_bars"]])
             self.assertEqual(store.book_progress(str(archive))["auto_detect"], 0)
 
-    def test_detector_failure_pauses_without_treating_book_as_uncensored(self):
+    def test_detector_failure_is_quarantined_and_queue_continues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Bad Series" / "Bad.cbz"
+            following = root / "Good Series" / "Good.cbz"
+            make_cbz(archive)
+            make_cbz(following)
+            original = archive.read_bytes()
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for path in (archive, following):
+                store.record_archive(scan_id, str(root), str(path), path.stat(), inspect_cbz_eligibility)
+            store.control_known_types_only(True)
+            processed = []
+
+            def detector(path, _job):
+                if path == str(archive):
+                    raise RuntimeError("CBZ has no supported image pages to inspect")
+                return {
+                    "page_count": 1,
+                    "pages_by_method": {
+                        "black_bars": ["001.jpg"], "transparent_black": [],
+                        "white_bars": [], "mosaic": [],
+                    },
+                    "detected_methods": ["black_bars"],
+                }
+
+            def processor(path, sequence, _job):
+                processed.append(path)
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(store, processor, detector=detector)
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(following))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+
+            issue_path = Path(processing_issue_destination(str(archive), str(root)))
+            progress = store.book_progress(str(issue_path))
+            self.assertFalse(archive.exists())
+            self.assertTrue(issue_path.exists())
+            self.assertEqual(issue_path.read_bytes(), original)
+            self.assertEqual(progress["state"], "quarantined")
+            self.assertEqual(
+                progress["last_error"],
+                "Censorship check failed: RuntimeError: CBZ has no supported image pages to inspect",
+            )
+            self.assertIsNone(progress["detected_methods"])
+            self.assertEqual(processed, [str(following)])
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["counts"]["quarantined"], 1)
+            self.assertTrue(any(event["event_type"] == "job_quarantined"
+                                and str(archive) in event["message"]
+                                and str(issue_path) in event["message"]
+                                for event in snapshot["events"]))
+
+    def test_quarantine_move_failure_logs_error_and_pauses_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "comix"
             archive = root / "Book.cbz"
@@ -263,19 +323,53 @@ class LibraryBacklogTests(unittest.TestCase):
             scan_id = store.start_scan(str(root))
             store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility)
             store.control_known_types_only(True)
-            processed = []
 
-            def fail_detection(*_args):
-                raise RuntimeError("model unavailable")
+            manager = LibraryBacklog(
+                store,
+                lambda *_: self.fail("processor called"),
+                detector=lambda *_: (_ for _ in ()).throw(RuntimeError("bad archive")),
+            )
+            with patch("library_backlog.os.rename", side_effect=OSError("access denied")):
+                manager.resume_queue(retry_failed=False)
+                manager._queue_thread.join(timeout=3)
 
-            manager = LibraryBacklog(store, lambda *_: processed.append(True), detector=fail_detection)
-            manager.resume_queue(retry_failed=False)
-            manager._queue_thread.join(timeout=3)
             progress = store.book_progress(str(archive))
+            self.assertTrue(archive.exists())
             self.assertEqual(progress["state"], "failed")
+            self.assertIn("Censorship check failed: RuntimeError: bad archive", progress["last_error"])
+            self.assertIn("could not move book to _processing issues: OSError: access denied",
+                          progress["last_error"])
             self.assertEqual(store.queue_control(), "paused")
-            self.assertIsNone(progress["detected_methods"])
-            self.assertEqual(processed, [])
+
+    def test_processing_failure_is_quarantined_and_queue_continues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            bad = root / "Bad.cbz"
+            good = root / "Good.cbz"
+            make_cbz(bad)
+            make_cbz(good)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for path in (bad, good):
+                store.record_archive(scan_id, str(root), str(path), path.stat(), inspect_cbz_eligibility)
+
+            def processor(path, sequence, _job):
+                if path == str(bad):
+                    raise RuntimeError("model rejected page")
+                add_uncensored_tag(path, sequence)
+                return {"path": path}
+
+            manager = LibraryBacklog(store, processor)
+            manager.resume_queue(retry_failed=False)
+            deadline = time.time() + 3
+            while time.time() < deadline and store.book_progress(str(good))["state"] != "completed":
+                time.sleep(0.02)
+            manager.pause_queue()
+            manager._queue_thread.join(timeout=2)
+
+            issue_path = Path(processing_issue_destination(str(bad), str(root)))
+            self.assertEqual(store.book_progress(str(issue_path))["state"], "quarantined")
+            self.assertEqual(store.book_progress(str(good))["state"], "completed")
 
     def test_saved_detection_is_reused_after_interrupted_job(self):
         with tempfile.TemporaryDirectory() as directory:

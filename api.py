@@ -573,6 +573,23 @@ def _encode_processed_page(processed_path, original_bytes, extension):
     return output.getvalue()
 
 
+def _zip_extra_signature(extra):
+    """Preserve metadata extras while excluding regenerated ZIP64 layout data."""
+    stable = bytearray()
+    offset = 0
+    while offset + 4 <= len(extra):
+        kind = int.from_bytes(extra[offset:offset + 2], 'little')
+        length = int.from_bytes(extra[offset + 2:offset + 4], 'little')
+        end = offset + 4 + length
+        if end > len(extra):
+            raise RuntimeError('Malformed ZIP metadata extra field')
+        if kind != 0x0001:
+            stable.extend(extra[offset:end])
+        offset = end
+    stable.extend(extra[offset:])
+    return bytes(stable)
+
+
 def _zip_info_signature(member):
     """Return the stable ZIP metadata fields that a rebuild must preserve."""
     return (
@@ -580,11 +597,14 @@ def _zip_info_signature(member):
         member.date_time,
         member.compress_type,
         member.comment,
-        member.extra,
+        _zip_extra_signature(member.extra),
         member.create_system,
         member.create_version,
         member.extract_version,
-        member.flag_bits & ~0x08,
+        # zipfile regenerates data-descriptor and filename-encoding flags.
+        # The decoded filename is checked above, so ASCII changing from a
+        # declared UTF-8 name to its equivalent ASCII encoding is harmless.
+        member.flag_bits & ~(0x08 | 0x800),
         member.volume,
         member.internal_attr,
         member.external_attr,
@@ -605,6 +625,9 @@ def _copy_archive_with_processed_pages(source_archive, destination, results, pag
             target.comment = source.comment
             for index, member in enumerate(source_members):
                 cloned_member = copy.copy(member)
+                # Sizes and offsets in ZIP64 extras describe the old layout.
+                # Let zipfile generate fresh values for the rebuilt payloads.
+                cloned_member.extra = _zip_extra_signature(member.extra)
                 if member.is_dir():
                     payload = b''
                 else:
@@ -620,6 +643,10 @@ def _copy_archive_with_processed_pages(source_archive, destination, results, pag
                     else:
                         payload = original_bytes
                 target.writestr(cloned_member, payload)
+                # writestr supplies Unix permissions when this field is zero.
+                # The central directory is written on close; restore the source
+                # value on its queued ZipInfo so unspecified permissions survive.
+                cloned_member.external_attr = member.external_attr
 
 
 def _verify_rebuilt_archive(source_archive, rebuilt_archive, page_indices, results=None):
@@ -892,9 +919,15 @@ def _run_model_pass(image_paths, model_type, session_id, pass_number,
     ensure_directory(output_dir)
 
     used_names = set()
+    used_stems = set()
     staged_names = []
     for index, image_path in enumerate(image_paths, start=1):
         name = unique_filename(os.path.basename(image_path), used_names)
+        # Different input extensions still share the same PNG output name.
+        # Reserve stems as well as full filenames to avoid overwriting pages.
+        while os.path.splitext(name)[0].casefold() in used_stems:
+            name = unique_filename(os.path.basename(image_path), used_names)
+        used_stems.add(os.path.splitext(name)[0].casefold())
         staged_path = os.path.join(model_input, name)
         copy_file_long_path(image_path, staged_path)
         staged_names.append(name)
@@ -972,7 +1005,13 @@ def _run_model_pass(image_paths, model_type, session_id, pass_number,
             f"{model_type} produced {len(results)} result(s) for "
             f"{len(image_paths)} input image(s). Output directory: {output_dir}"
         )
-    return results
+    by_stem = {os.path.splitext(result['filename'])[0].casefold(): result
+               for result in results}
+    expected_stems = [os.path.splitext(name)[0].casefold() for name in staged_names]
+    if len(by_stem) != len(results) or set(by_stem) != set(expected_stems):
+        raise RuntimeError(f"{model_type} output filenames do not match the staged input pages")
+    # Map outputs to input order rather than assuming their sorted names match.
+    return [by_stem[stem] for stem in expected_stems]
 
 
 def process_images(image_paths, model_types, session_id, job_work_dir,
@@ -2238,7 +2277,9 @@ if __name__ == '__main__':
     # Ensure output directories exist
     ensure_directory(CAMELIA_TEMP)
     ensure_directory(CAMELIA_OUTPUT)
-    if (os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    debug = os.environ.get('CAMELIA_DEBUG', '').strip().lower() in {'1', 'true', 'yes'}
+    serving_process = not debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
+    if (serving_process
             and library_backlog.store.schedule_enabled()
             and library_backlog.store.scheduled_autostart()):
         # Only the serving process may own the scheduled worker. The store
@@ -2248,4 +2289,6 @@ if __name__ == '__main__':
         except ValueError as exc:
             app.logger.error("Scheduled backlog could not resume safely: %s", exc)
             library_backlog.pause_queue()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Reloading during a book job abandons its worker and resets queue state.
+    # Development reload/debugging must be an explicit opt-in.
+    app.run(host='0.0.0.0', port=5000, debug=debug, use_reloader=debug)

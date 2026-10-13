@@ -30,6 +30,7 @@ PROCESSED_MARKERS = ("uncensored", "decensored")
 DEFAULT_ROOTS = (r"X:\comix", r"Z:\comics\Comix")
 EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".stversions", ".stfolder", "@eadir", "$recycle.bin", "system volume information",
+    "_processing issues",
 })
 DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars", "mosaic")
 BAR_METHODS = DEFAULT_SEQUENCE[:3]
@@ -42,6 +43,32 @@ PREVIOUS_DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars")
 ACTIVE_STATES = ("queued", "processing")
 SCHEDULE_ROOT = DEFAULT_ROOTS[0]
 SCHEDULE_TIMEZONE = ZoneInfo("America/Denver")
+PROCESSING_ISSUES_DIRECTORY = "_processing issues"
+
+
+def _filesystem_path(path: str) -> str:
+    """Use extended-length paths for Windows filesystem operations."""
+    value = os.fspath(path)
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    normalized = os.path.abspath(value)
+    if normalized.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + normalized[2:]
+    return "\\\\?\\" + normalized
+
+
+def processing_issue_destination(source_path: str, root_path: str) -> str:
+    """Return the matching path under the library root's sibling issue folder."""
+    source = os.path.abspath(source_path)
+    root = os.path.abspath(root_path)
+    try:
+        relative = os.path.relpath(source, root)
+    except ValueError as exc:
+        raise ValueError(f"Book is outside its library root: {source}") from exc
+    parts = Path(relative).parts
+    if relative == os.curdir or not parts or parts[0] == os.pardir:
+        raise ValueError(f"Book is outside its library root: {source}")
+    return os.path.join(os.path.dirname(root), PROCESSING_ISSUES_DIRECTORY, relative)
 
 
 def normalize_detection_result(result: dict) -> dict:
@@ -200,6 +227,12 @@ def inspect_cbz_eligibility(path: str) -> dict:
     try:
         with zipfile.ZipFile(path) as archive:
             result["page_count"] = _archive_page_count(archive)
+            if result["page_count"] == 0:
+                result.update(
+                    eligible=False,
+                    reason="Archive contains no supported image pages; left unchanged for review",
+                )
+                return result
             member = _comicinfo_member(archive)
             if member is None:
                 if not filename_marked:
@@ -249,6 +282,8 @@ def pending_decensor_methods(inspection: dict, selected_methods: Iterable[str],
                             reprocess: bool = False) -> list[str]:
     """Return ordered methods still needed; legacy generic markers are unknown."""
     selected = list(dict.fromkeys(selected_methods))
+    if inspection.get("page_count") == 0:
+        return []
     if inspection.get("parse_error") and inspection.get("reason") == "Archive could not be inspected":
         return []
     if inspection.get("eligible") is False and not inspection.get("already_processed"):
@@ -267,6 +302,18 @@ def archive_is_processed(path: str) -> bool:
 
 def _clone_zip_info(member: zipfile.ZipInfo) -> zipfile.ZipInfo:
     return copy.copy(member)
+
+
+def _replace_metadata_archive(temporary: str, source: str) -> None:
+    """Wait briefly for Windows/SMB scanners to release an atomic replacement."""
+    for attempt in range(5):
+        try:
+            os.replace(temporary, source)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1 * (2 ** attempt))
 
 
 def add_uncensored_tag(path: str, applied_methods: Iterable[str] = ()) -> dict:
@@ -346,7 +393,7 @@ def add_uncensored_tag(path: str, applied_methods: Iterable[str] = ()) -> dict:
         with zipfile.ZipFile(temporary) as check:
             if check.testzip() is not None:
                 raise RuntimeError("Tagged archive failed CRC verification")
-        os.replace(temporary, source)
+        _replace_metadata_archive(temporary, source)
         return {"changed": True, "created": created, "member": member_name,
                 "applied_methods": recorded_methods}
     finally:
@@ -1089,6 +1136,48 @@ class BacklogStore:
             )
             self._event(db, "job_failed", f"Processing failed: {error} (attempt {row['attempts']})", book_id=book_id)
 
+    def quarantine_job(self, book_id: int, original_path: str, issue_path: str,
+                       error: str, issue_stat: os.stat_result) -> None:
+        """Record a failed book after it has been moved out of the active library."""
+        now = utc_now()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT state,attempts,current_stage,started_at FROM books WHERE id=?", (book_id,)
+            ).fetchone()
+            if row is None or row["state"] not in {"processing", "failed"}:
+                raise ValueError(f"Cannot quarantine book {book_id} from state {row['state'] if row else 'missing'}")
+            if row["current_stage"]:
+                db.execute(
+                    """UPDATE book_stages SET state='failed', failed_at=?, last_error=?, updated_at=?
+                       WHERE book_id=? AND stage=? AND state='running'""",
+                    (now, error, now, book_id, row["current_stage"]),
+                )
+            db.execute(
+                """UPDATE book_phases SET state='failed', completed_at=?, last_error=?, updated_at=?
+                   WHERE book_id=? AND state='running'""",
+                (now, error, now, book_id),
+            )
+            db.execute(
+                """UPDATE books SET source_path=?, state='quarantined', current_stage=NULL,
+                   last_error=?, output_path=NULL, file_size=?, mtime_ns=?, completed_at=?,
+                   duration_seconds=?, updated_at=? WHERE id=?""",
+                (issue_path, error, issue_stat.st_size, issue_stat.st_mtime_ns, now,
+                 elapsed_seconds(row["started_at"], now), now, book_id),
+            )
+            self._event(
+                db,
+                "job_quarantined",
+                f"Quarantined after {error}: {original_path} -> {issue_path} (attempt {row['attempts']})",
+                book_id=book_id,
+            )
+
+    def source_path_known(self, source_path: str) -> bool:
+        with self.connect() as db:
+            return db.execute(
+                "SELECT 1 FROM books WHERE source_path=? COLLATE NOCASE LIMIT 1",
+                (os.path.abspath(source_path),),
+            ).fetchone() is not None
+
     def defer_job(self, book_id: int, reason: str) -> None:
         """Undo a claim made before an unavailable source root was detected."""
         with self.connect() as db:
@@ -1338,7 +1427,7 @@ class BacklogStore:
             counts = {row["state"]: row["count"] for row in db.execute("SELECT state,COUNT(*) AS count FROM books GROUP BY state")}
             current = db.execute("SELECT source_path,current_stage FROM books WHERE state='processing' ORDER BY started_at LIMIT 1").fetchone()
             recent = db.execute(
-                """SELECT * FROM books WHERE state IN ('processing','completed','failed')
+                """SELECT * FROM books WHERE state IN ('processing','completed','failed','quarantined')
                    OR (state='skipped' AND detection_checked_at IS NOT NULL)
                    ORDER BY CASE state WHEN 'processing' THEN 0 ELSE 1 END,
                             updated_at DESC, id DESC LIMIT 12"""
@@ -1357,7 +1446,7 @@ class BacklogStore:
                     "windows": "Every day 00:00–05:00; Monday–Friday 09:00–17:00",
                     **processing_window_status(),
                 },
-                "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "processing", "completed", "failed", "skipped")},
+                "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "processing", "completed", "failed", "quarantined", "skipped")},
                 "current_file": (
                     current["source_path"] if current else
                     scan["current_path"] if scan and scan["status"] in {"running", "paused"} else None
@@ -1585,6 +1674,61 @@ class LibraryBacklog:
             return True
         return False
 
+    def _available_issue_destination(self, job: dict) -> str:
+        preferred = processing_issue_destination(job["source_path"], job["root_path"])
+        if (not os.path.exists(_filesystem_path(preferred))
+                and not self.store.source_path_known(preferred)):
+            return preferred
+        stem, extension = os.path.splitext(preferred)
+        candidate = f"{stem} (issue {job['id']}){extension}"
+        sequence = 2
+        while (os.path.exists(_filesystem_path(candidate))
+               or self.store.source_path_known(candidate)):
+            candidate = f"{stem} (issue {job['id']}-{sequence}){extension}"
+            sequence += 1
+        return candidate
+
+    def quarantine_job(self, job: dict, error: str) -> str:
+        """Move one bad CBZ aside and preserve its exact failure in the backlog."""
+        source = os.path.abspath(job["source_path"])
+        destination = self._available_issue_destination(job)
+        os.makedirs(_filesystem_path(os.path.dirname(destination)), exist_ok=True)
+        os.rename(_filesystem_path(source), _filesystem_path(destination))
+        try:
+            issue_stat = os.stat(_filesystem_path(destination))
+            self.store.quarantine_job(job["id"], source, destination, error, issue_stat)
+        except Exception:
+            try:
+                if (os.path.exists(_filesystem_path(destination))
+                        and not os.path.exists(_filesystem_path(source))):
+                    os.rename(_filesystem_path(destination), _filesystem_path(source))
+            except Exception:
+                LOGGER.critical(
+                    "Could not restore %s after quarantine state update failed", source,
+                    exc_info=True,
+                )
+            raise
+        return destination
+
+    def _quarantine_failed_job(self, job: dict, error: str) -> bool:
+        """Return True after quarantine, or pause safely if the move cannot complete."""
+        try:
+            destination = self.quarantine_job(job, error)
+            LOGGER.error("Quarantined failed backlog book %s at %s: %s",
+                         job["source_path"], destination, error)
+            return True
+        except Exception as quarantine_error:
+            combined = (
+                f"{error}; could not move book to {PROCESSING_ISSUES_DIRECTORY}: "
+                f"{type(quarantine_error).__name__}: {quarantine_error}"
+            )
+            LOGGER.exception("Could not quarantine failed backlog book %s", job["source_path"])
+            try:
+                self.store.fail_job(job["id"], combined)
+            finally:
+                self.pause_queue()
+            return False
+
     def set_batch_schedule(self, enabled: bool) -> None:
         """Opt-in scheduled processing; disabling never frees a running job."""
         if enabled and self.require_backup_offload and self.backup_callback is None:
@@ -1673,6 +1817,12 @@ class LibraryBacklog:
                 return
             if self._finish_cancellation(job):
                 continue
+            if job.get("archive_page_count") == 0:
+                self.store.skip_job(
+                    book_id,
+                    "Archive contains no supported image pages; left unchanged for review",
+                )
+                continue
             if self.store.known_types_only() and job["auto_detect"]:
                 try:
                     if job["detected_methods"] is None:
@@ -1714,9 +1864,10 @@ class LibraryBacklog:
                     if self._skip_if_source_removed(job, "Source disappeared during censorship check"):
                         continue
                     LOGGER.exception("Censorship check failed for %s", job["source_path"])
-                    self.store.fail_job(book_id, f"Censorship check failed: {type(exc).__name__}: {exc}")
-                    self.pause_queue()
-                    return
+                    error = f"Censorship check failed: {type(exc).__name__}: {exc}"
+                    if not self._quarantine_failed_job(job, error):
+                        return
+                    continue
             if self._finish_cancellation(job):
                 continue
             if self.backup_callback is not None:
@@ -1770,7 +1921,8 @@ class LibraryBacklog:
                 if self._skip_if_source_removed(job, "Source disappeared during processing"):
                     continue
                 LOGGER.exception("Backlog job failed for %s", job["source_path"])
-                self.store.fail_job(book_id, f"{type(exc).__name__}: {exc}")
+                if not self._quarantine_failed_job(job, f"{type(exc).__name__}: {exc}"):
+                    return
             else:
                 if self.backup_callback is not None:
                     try:

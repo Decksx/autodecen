@@ -29,7 +29,7 @@
                 </div>
             </div>
 
-            <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+            <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
                 <div v-for="item in totals" :key="item.label" class="rounded-md bg-highlight-low p-3 border border-overlay">
                     <div class="text-xs text-subtle">{{ item.label }}</div>
                     <div class="text-xl text-foam">{{ item.value }}</div>
@@ -68,6 +68,11 @@
             <p class="text-xs text-subtle">
                 Queue priority: books over 350 pages and series folders containing more than 6 books wait until
                 all ordinary queued books are finished. Original FIFO order is preserved within each group.
+            </p>
+            <p class="text-xs text-subtle">
+                A book that fails censorship detection or processing is moved to a sibling
+                <strong>_processing issues</strong> folder with its library subfolders preserved. The error stays
+                in the backlog for diagnosis, and the queue continues with the next book.
             </p>
             <p v-if="actionError" class="text-sm text-love">{{ actionError }}</p>
 
@@ -251,6 +256,7 @@ const totals = computed(() => [
     { label: 'Queued', value: status.value?.counts.queued ?? 0 },
     { label: 'Completed', value: status.value?.counts.completed ?? 0 },
     { label: 'Failed', value: status.value?.counts.failed ?? 0 },
+    { label: 'Issues', value: status.value?.counts.quarantined ?? 0 },
     { label: 'Skipped', value: status.value?.counts.skipped ?? 0 }
 ]);
 

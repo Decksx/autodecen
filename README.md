@@ -172,6 +172,11 @@ unless that override is enabled.
 
 ### Resumable library backlog
 
+Normal API startup disables Flask's development debugger and automatic file
+reloads, so code edits cannot interrupt a running library job. Restart the API
+after updating code. For development only, set `CAMELIA_DEBUG=true` to opt into
+the debugger and automatic reloads.
+
 The **Library Decensor Backlog** section crawls either `X:\comix` or
 `Z:\comics\Comix` recursively. It reads the filename and
 `ComicInfo.xml` directly from each CBZ. Generic `uncensored`/`decensored`
@@ -256,6 +261,12 @@ the next book. Cancellation is refused after final rebuilt-archive installation
 has begun because that short phase must remain atomic. If an archive is moved
 or deleted manually while its job is active, Camelia also marks it skipped
 instead of failed, so Resume does not repeatedly retry the missing path.
+When censorship detection or model processing fails for one book, Camelia logs
+the complete error, moves the CBZ to a `_processing issues` folder beside the
+selected library root, and continues with the next queued book. The relative
+series path is preserved. Quarantined jobs are terminal and are not requeued by
+Resume. If the move itself fails, the source remains in place and the queue
+pauses so the book cannot be lost or repeatedly processed.
 The backlog also has an opt-in `X:\comix` batch schedule: every night from
 00:00–05:00 and Monday–Friday from 09:00–17:00 in America/Denver. Enable it in
 the Library Decensor Backlog panel after choosing/crawling `X:\comix` **and**
