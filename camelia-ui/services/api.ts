@@ -123,7 +123,7 @@ export interface LibraryBacklogStatus {
         window_ends_at: string | null;
         next_window_at: string | null;
     };
-    counts: Record<'discovered' | 'eligible' | 'queued' | 'processing' | 'completed' | 'failed' | 'quarantined' | 'skipped', number>;
+    counts: Record<'discovered' | 'eligible' | 'queued' | 'held' | 'processing' | 'completed' | 'failed' | 'quarantined' | 'skipped', number>;
     current_file: string | null;
     current_stage: string | null;
     recent_books: LibraryBookProgress[];
@@ -230,14 +230,57 @@ export async function controlLibrarySchedule(enabled: boolean): Promise<void> {
 export async function requeueLibraryBook(
     sourcePath: string,
     modelTypes: ProcessingType[],
-    reprocess: boolean
+    reprocess: boolean,
+    automatic = false
 ): Promise<ProcessingType[]> {
     const data = await backlogRequest('/queue/book', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source_path: sourcePath, model_types: modelTypes, reprocess })
+        body: JSON.stringify({ source_path: sourcePath, model_types: modelTypes, reprocess, automatic })
     });
     return data.selected_sequence as ProcessingType[];
+}
+
+export interface LibraryQueueBook {
+    id: number;
+    source_path: string;
+    root_path: string;
+    metadata_title: string | null;
+    state: string;
+    attempts: number;
+    current_stage: string | null;
+    last_error: string | null;
+    selected_sequence: ProcessingType[];
+    auto_detect: number;
+    queue_priority: number;
+    archive_page_count: number | null;
+    series_path: string | null;
+    deferred: boolean;
+    updated_at: string;
+}
+
+export interface LibraryQueuePage {
+    items: LibraryQueueBook[];
+    total: number;
+    counts: Record<string, number>;
+    offset: number;
+    limit: number;
+}
+
+export type LibraryQueueEdit = 'next' | 'normal' | 'hold' | 'release';
+
+export async function getLibraryQueueBooks(
+    state: string, query: string, root: string, offset = 0
+): Promise<LibraryQueuePage> {
+    const params = new URLSearchParams({ state, query, root, offset: String(offset), limit: '50' });
+    return backlogRequest(`/books?${params}`);
+}
+
+export async function editLibraryQueueBooks(bookIds: number[], action: LibraryQueueEdit): Promise<void> {
+    await backlogRequest('/books/edit', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ book_ids: bookIds, action })
+    });
 }
 
 export async function listLocalCbzSources(
