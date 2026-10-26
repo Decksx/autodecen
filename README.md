@@ -207,6 +207,20 @@ gain an `eligibility_version` column automatically; previously scanned rows are
 reclassified once under the method-aware policy, then return to fingerprint
 reuse. The UI can manually queue one previously crawled book with selected
 methods and an explicit reprocess override.
+The **Book queue** browser lists the full backlog in pages of 50. Search by
+title or path, filter by library/status, and open a book's pass progress.
+Select queued books to **Process selected next**, restore their normal order,
+or **Hold selected** without deleting any archives. The Held filter lets you
+return those books to the queue. These choices persist across restarts and
+rescans; processing books cannot be edited. Explicit next-book priority overrides
+the size tiers below but never overrides library scheduling windows.
+**Edit methods** can restore automatic processing or choose passes for the
+whole book, with an explicit repeat-applied-methods option. Saving queues the
+book; failed/skipped books offer **Retry / edit**, while quarantined archives
+must first be restored to their normal library path. Bulk edits are atomic: if
+any selected book has started processing, refresh the list and try again.
+Queue controls only change backlog records, and never rename or delete books.
+
 Queue selection uses two FIFO tiers so short work is not trapped behind unusually
 large batches. Books with more than 350 supported image pages, and every book in
 a series directory containing more than 6 known CBZs, run only after all ordinary
