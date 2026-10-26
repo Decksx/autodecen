@@ -1675,6 +1675,36 @@ def get_library_book_progress():
     return jsonify(book)
 
 
+@app.route('/api/library-backlog/books', methods=['GET'])
+def list_library_queue_books():
+    blocked = _local_backlog_request()
+    if blocked:
+        return blocked
+    try:
+        return jsonify(library_backlog.store.list_queue_books(
+            state=request.args.get('state', 'queued'), query=request.args.get('query', ''),
+            root=request.args.get('root', ''), limit=int(request.args.get('limit', '50')),
+            offset=int(request.args.get('offset', '0')),
+        ))
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route('/api/library-backlog/books/edit', methods=['POST'])
+def edit_library_queue_books():
+    blocked = _local_backlog_request()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A queue edit object is required"}), 400
+    try:
+        changed = library_backlog.store.edit_queue_books(data.get('book_ids'), data.get('action'))
+        return jsonify({"success": True, "changed": changed})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+
+
 @app.route('/api/library-backlog/scan/start', methods=['POST'])
 def start_library_scan():
     blocked = _local_backlog_request()
@@ -1778,12 +1808,18 @@ def requeue_library_book():
     if blocked:
         return blocked
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "A book edit object is required"}), 400
     try:
         source = str(data.get('source_path') or '').strip()
         if not source:
             raise ValueError('Choose a CBZ path from the crawled library')
         methods = normalize_model_types(data.get('model_types') or DEFAULT_SEQUENCE)
-        sequence = library_backlog.store.requeue_book(source, methods, bool(data.get('reprocess')))
+        if not isinstance(data.get('automatic', False), bool) or not isinstance(data.get('reprocess', False), bool):
+            raise ValueError('automatic and reprocess must be true or false')
+        sequence = library_backlog.store.requeue_book(
+            source, methods, data.get('reprocess', False), automatic=data.get('automatic', False)
+        )
         return jsonify({"success": True, "selected_sequence": sequence})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
