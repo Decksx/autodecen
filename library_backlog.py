@@ -556,6 +556,7 @@ class BacklogStore:
                 ("detection_page_count", "INTEGER"),
                 ("archive_page_count", "INTEGER"),
                 ("series_path", "TEXT"),
+                ("queue_priority", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE books ADD COLUMN {name} {definition}")
@@ -751,6 +752,8 @@ class BacklogStore:
                       "All decensor methods already recorded")
         with self.connect() as db:
             prior = db.execute("SELECT id, state FROM books WHERE source_path=?", (normalized,)).fetchone()
+            if prior and prior["state"] == "held" and sequence:
+                state = "held"
             values = (
                 root, scan_id, stat.st_size, stat.st_mtime_ns,
                 inspection.get("title"), json.dumps(inspection.get("tags", [])),
@@ -797,7 +800,8 @@ class BacklogStore:
                        VALUES(?,?,'pending',?)""",
                     (book_id, stage, now),
                 )
-            decision = "Eligible and queued" if state == "queued" else f"Skipped: {reason}"
+            decision = ("Eligible and queued" if state == "queued" else
+                        "Eligible; held by user" if state == "held" else f"Skipped: {reason}")
             if inspection.get("parse_error"):
                 decision += f"; metadata warning: {inspection['parse_error']}"
             self._event(db, "scan_decision", decision, scan_id=scan_id, book_id=book_id)
@@ -806,7 +810,7 @@ class BacklogStore:
 
     @staticmethod
     def _increment_scan(db, scan_id: int, state: str, unchanged=False, parse_error=False) -> None:
-        eligible = int(state in {"eligible", "queued", "processing", "completed", "failed"})
+        eligible = int(state in {"eligible", "queued", "held", "processing", "completed", "failed"})
         skipped = int(state == "skipped")
         db.execute(
             """UPDATE scans SET total_found=total_found+1, scanned_count=scanned_count+?,
@@ -910,6 +914,13 @@ class BacklogStore:
 
         while True:
             with self._lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                promoted = db.execute(
+                    f"SELECT * FROM books WHERE {scope} AND queue_priority>0 "
+                    "ORDER BY queue_priority DESC, queued_at, id LIMIT 1", parameters,
+                ).fetchone()
+                if promoted is not None:
+                    return self._claim_row(db, promoted)
                 # Preserve FIFO within each tier. Known ordinary jobs always
                 # run before large books/series, regardless of discovery time.
                 row = db.execute(
@@ -1304,7 +1315,7 @@ class BacklogStore:
             return cursor.rowcount
 
     def requeue_book(self, source_path: str, selected_methods: Iterable[str],
-                     reprocess: bool = False) -> list[str]:
+                     reprocess: bool = False, *, automatic: bool = False) -> list[str]:
         """Queue one known book for missing methods or an explicit repeat run."""
         source = os.path.abspath(source_path)
         with self.connect() as db:
@@ -1322,12 +1333,17 @@ class BacklogStore:
         inspection = inspect_cbz_eligibility(source)
         if inspection["reason"] == "Archive could not be inspected":
             raise ValueError(f"Cannot inspect CBZ: {inspection['parse_error']}")
-        sequence = pending_decensor_methods(inspection, selected_methods, reprocess)
+        if automatic and reprocess:
+            raise ValueError("Automatic processing cannot force previously applied methods")
+        sequence = pending_decensor_methods(
+            inspection, DEFAULT_SEQUENCE if automatic else selected_methods, reprocess
+        )
         if not sequence:
             raise ValueError("Selected methods are already recorded; enable reprocess to repeat them")
         stat = os.stat(source)
         now = utc_now()
-        with self.connect() as db:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             current = db.execute("SELECT state FROM books WHERE id=?", (row["id"],)).fetchone()
             if current["state"] == "processing":
                 raise ValueError("Cannot change a book while it is processing")
@@ -1335,11 +1351,11 @@ class BacklogStore:
                 """UPDATE books SET state='queued', selected_sequence=?, attempts=0,
                    queued_at=?, started_at=NULL, completed_at=NULL, current_stage=NULL,
                    duration_seconds=NULL, last_error=NULL, output_path=NULL,
-                   file_size=?, mtime_ns=?, updated_at=?, auto_detect=0,
+                   file_size=?, mtime_ns=?, updated_at=?, auto_detect=?,
                    detected_methods=NULL, detected_pages=NULL, detection_checked_at=NULL,
                    detection_duration_seconds=NULL, detection_page_count=NULL
                    WHERE id=?""",
-                (json.dumps(sequence), now, stat.st_size, stat.st_mtime_ns, now, row["id"]),
+                (json.dumps(sequence), now, stat.st_size, stat.st_mtime_ns, now, int(automatic), row["id"]),
             )
             for stage in sequence:
                 db.execute(
@@ -1353,9 +1369,94 @@ class BacklogStore:
                 )
             db.execute("DELETE FROM book_phases WHERE book_id=?", (row["id"],))
             self._event(db, "manual_requeue",
-                        f"Queued {source} for {' -> '.join(sequence)} (reprocess={reprocess})",
+                        f"Queued {source} for {' -> '.join(sequence)} (reprocess={reprocess}, automatic={automatic})",
                         book_id=row["id"])
         return sequence
+
+    def list_queue_books(self, *, state: str = "queued", query: str = "",
+                         root: str = "", limit: int = 50, offset: int = 0) -> dict:
+        """Page/search the durable backlog without reading archives or page audits."""
+        states = {"all", "queued", "held", "processing", "failed", "quarantined", "skipped", "completed"}
+        if state not in states:
+            raise ValueError("Invalid book status")
+        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
+            raise ValueError("Use a limit from 1 to 100 and a nonnegative offset")
+        if len(query) > 500:
+            raise ValueError("Search is limited to 500 characters")
+        clauses, parameters = [], []
+        if root:
+            clauses.append("b.root_path = ? COLLATE NOCASE")
+            parameters.append(root)
+        if query.strip():
+            escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("(b.source_path LIKE ? ESCAPE '\\' OR b.metadata_title LIKE ? ESCAPE '\\')")
+            parameters.extend([f"%{escaped}%"] * 2)
+        scope = " AND ".join(clauses) or "1=1"
+        filtered = scope + (" AND b.state=?" if state != "all" else "")
+        selected_parameters = parameters + ([state] if state != "all" else [])
+        with self.connect() as db:
+            counts = {r["state"]: r["count"] for r in db.execute(
+                f"SELECT b.state,COUNT(*) AS count FROM books b WHERE {scope} GROUP BY b.state", parameters
+            )}
+            total = db.execute(f"SELECT COUNT(*) FROM books b WHERE {filtered}", selected_parameters).fetchone()[0]
+            rows = db.execute(
+                f"""SELECT b.id,b.source_path,b.root_path,b.metadata_title,b.state,b.attempts,
+                           b.current_stage,b.last_error,b.selected_sequence,b.auto_detect,
+                           b.queue_priority,b.archive_page_count,b.series_path,b.updated_at,
+                           CASE WHEN b.archive_page_count > ? OR s.book_count > ? THEN 1 ELSE 0 END AS deferred
+                    FROM books b LEFT JOIN (
+                        SELECT root_path,series_path,COUNT(*) AS book_count FROM books
+                        GROUP BY root_path COLLATE NOCASE,series_path COLLATE NOCASE
+                    ) s ON s.root_path=b.root_path COLLATE NOCASE AND s.series_path=b.series_path COLLATE NOCASE
+                    WHERE {filtered}
+                    ORDER BY CASE b.state WHEN 'processing' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                             CASE WHEN b.queue_priority>0 THEN 0
+                                  WHEN b.archive_page_count IS NOT NULL AND b.archive_page_count<=? AND s.book_count<=? THEN 1
+                                  WHEN b.archive_page_count IS NULL AND s.book_count<=? THEN 2 ELSE 3 END,
+                             b.queue_priority DESC,b.queued_at,b.id
+                    LIMIT ? OFFSET ?""",
+                (DEFER_PAGE_COUNT, DEFER_SERIES_BOOK_COUNT, *selected_parameters,
+                 DEFER_PAGE_COUNT, DEFER_SERIES_BOOK_COUNT, DEFER_SERIES_BOOK_COUNT, limit, offset),
+            ).fetchall()
+            items = []
+            for row in rows:
+                item = dict(row)
+                item["selected_sequence"] = json.loads(item["selected_sequence"])
+                item["deferred"] = bool(item["deferred"])
+                items.append(item)
+            return {"items": items, "total": total, "counts": counts, "limit": limit, "offset": offset}
+
+    def edit_queue_books(self, book_ids: list[int], action: str) -> int:
+        """Atomically edit pending jobs; never delete archives or processing history."""
+        if not isinstance(action, str) or action not in {"hold", "release", "next", "normal"}:
+            raise ValueError("Invalid queue edit action")
+        if (not isinstance(book_ids, list) or not 1 <= len(book_ids) <= 100
+                or any(type(i) is not int or i < 1 for i in book_ids)
+                or len(set(book_ids)) != len(book_ids)):
+            raise ValueError("Choose 1 to 100 distinct book IDs")
+        placeholders = ",".join("?" for _ in book_ids)
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = {r["id"]: r for r in db.execute(
+                f"SELECT id,state,source_path FROM books WHERE id IN ({placeholders})", book_ids
+            )}
+            if len(rows) != len(book_ids):
+                raise ValueError("A selected book is no longer in the backlog; refresh the list")
+            expected = "held" if action == "release" else "queued"
+            if any(r["state"] != expected for r in rows.values()):
+                raise ValueError(f"This action requires {expected} books; refresh the list. Processing books are locked.")
+            now = utc_now()
+            priority = db.execute("SELECT COALESCE(MAX(queue_priority),0) FROM books").fetchone()[0]
+            for index, book_id in enumerate(book_ids):
+                if action in {"hold", "release"}:
+                    db.execute("UPDATE books SET state=?,updated_at=? WHERE id=?",
+                               ("held" if action == "hold" else "queued", now, book_id))
+                else:
+                    # Preserve the selected list's order ahead of prior promotions.
+                    value = priority + len(book_ids) - index if action == "next" else 0
+                    db.execute("UPDATE books SET queue_priority=?,updated_at=? WHERE id=?", (value, now, book_id))
+                self._event(db, f"queue_{action}", f"Queue {action}: {rows[book_id]['source_path']}", book_id=book_id)
+        return len(book_ids)
 
     @staticmethod
     def _progress_rows(db: sqlite3.Connection, books: list[sqlite3.Row],
@@ -1446,7 +1547,7 @@ class BacklogStore:
                     "windows": "Every day 00:00–05:00; Monday–Friday 09:00–17:00",
                     **processing_window_status(),
                 },
-                "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "processing", "completed", "failed", "quarantined", "skipped")},
+                "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "held", "processing", "completed", "failed", "quarantined", "skipped")},
                 "current_file": (
                     current["source_path"] if current else
                     scan["current_path"] if scan and scan["status"] in {"running", "paused"} else None
