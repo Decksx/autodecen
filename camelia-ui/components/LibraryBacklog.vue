@@ -121,6 +121,8 @@
                 </p>
             </div>
 
+            <LibraryQueue :roots="roots" @changed="refresh" @inspect="inspectQueueBook" />
+
             <div class="rounded-md bg-base border border-overlay p-4 space-y-3">
                 <h3 class="text-sm text-foam">Queue one previously crawled book</h3>
                 <input v-model="bookPath" type="text" placeholder="Full path to a CBZ in the crawled library"
@@ -153,7 +155,7 @@
             </div>
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-3">
-                <h3 class="text-sm text-foam">Archive pass progress</h3>
+                <h3 ref="progressHeading" class="text-sm text-foam">Archive pass progress</h3>
                 <p class="text-xs text-subtle">A finished pass is only marked applied after the rebuilt CBZ is installed and its method tags are verified. Showing the current and recent jobs; enter a path above to look up another book.</p>
                 <p v-if="!visibleBooks.length" class="text-xs text-subtle">No processed archive progress yet.</p>
                 <div v-for="book in visibleBooks" :key="book.id" class="rounded-md border border-overlay bg-surface p-3 space-y-2">
@@ -222,6 +224,7 @@ import {
     startLibraryScan
 } from '@/services/api';
 import type { LibraryBacklogStatus, LibraryBookProgress, ProcessingType } from '@/services/api';
+import LibraryQueue from '@/components/LibraryQueue.vue';
 
 const fallbackRoots = ['X:\\comix', 'Z:\\comics\\Comix'];
 const status = ref<LibraryBacklogStatus | null>(null);
@@ -233,6 +236,7 @@ const bookPath = ref('');
 const manualMethods = ref<ProcessingType[]>(['black_bars']);
 const manualReprocess = ref(false);
 const lookedUpBook = ref<LibraryBookProgress | null>(null);
+const progressHeading = ref<HTMLElement | null>(null);
 const methodChoices: Array<{ value: ProcessingType; label: string }> = [
     { value: 'black_bars', label: 'Black bars' },
     { value: 'transparent_black', label: 'Transparent black' },
@@ -333,6 +337,14 @@ function selectAllManualMethods(): void {
 function lookupBook(): void {
     void run(async () => {
         lookedUpBook.value = await getLibraryBookProgress(bookPath.value.trim());
+    });
+}
+
+function inspectQueueBook(path: string): void {
+    bookPath.value = path;
+    void run(async () => {
+        lookedUpBook.value = await getLibraryBookProgress(path);
+        progressHeading.value?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
 }
 
