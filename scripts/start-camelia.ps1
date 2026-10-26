@@ -108,23 +108,27 @@ function Stop-ProcessTree {
         return
     }
 
-    $Process.Refresh()
-    if (-not $Process.HasExited) {
-        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-    }
+    # npm.cmd and nuxt start node children that outlive their parent, so
+    # stop the whole tree, not just the process the launcher started.
+    & taskkill.exe /PID $Process.Id /T /F 2>&1 | Out-Null
 
-    Start-Sleep -Milliseconds 300
-    $listenerProcessIds = Get-NetTCPConnection `
-        -LocalPort $Port `
-        -State Listen `
-        -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty OwningProcess -Unique
-
-    foreach ($listenerProcessId in $listenerProcessIds) {
-        if ($listenerProcessId -ne $PID) {
-            Stop-Process -Id $listenerProcessId -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $listenerProcessIds = Get-NetTCPConnection `
+            -LocalPort $Port `
+            -State Listen `
+            -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            Where-Object { $_ -ne $PID -and $_ -ne 0 }
+        if (-not $listenerProcessIds) {
+            return
         }
+        foreach ($listenerProcessId in $listenerProcessIds) {
+            & taskkill.exe /PID $listenerProcessId /T /F 2>&1 | Out-Null
+        }
+        Start-Sleep -Milliseconds 300
     }
+    Write-Host "Port $Port is still in use after stopping Camelia." -ForegroundColor Yellow
 }
 
 try {
