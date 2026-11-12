@@ -1705,6 +1705,24 @@ def edit_library_queue_books():
         return jsonify({"error": str(exc)}), 409
 
 
+@app.route('/api/library-backlog/books/prune-missing', methods=['POST'])
+def prune_missing_library_books():
+    """Local-only preview/confirmed pruning; never removes archive files."""
+    blocked = _local_backlog_request()
+    if blocked:
+        return blocked
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or type(data.get('dry_run', True)) is not bool:
+        return jsonify({"error": "A prune object with boolean dry_run is required"}), 400
+    try:
+        return jsonify(library_backlog.prune_missing_books(
+            dry_run=data.get('dry_run', True), expected_count=data.get('expected_count'),
+            snapshot_digest=data.get('snapshot_digest'),
+        ))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+
+
 @app.route('/api/library-backlog/scan/start', methods=['POST'])
 def start_library_scan():
     blocked = _local_backlog_request()

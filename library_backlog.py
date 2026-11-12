@@ -1582,6 +1582,15 @@ class LibraryBacklog:
         self._cancel_lock = threading.Lock()
         self._cancel_book_id: int | None = None
 
+    def prune_missing_books(self, **options) -> dict:
+        """Preview/apply missing records only after crawl and queue workers settle."""
+        from backlog_prune import prune_missing_books
+        with self._thread_lock:
+            if (any(thread.is_alive() for thread in self._scan_threads.values())
+                    or (self._queue_thread is not None and self._queue_thread.is_alive())):
+                raise ValueError("Pause the crawl and queue, then wait for active work to finish")
+            return prune_missing_books(self.store, **options)
+
     @staticmethod
     def validate_root(root: str, allowed_roots: Iterable[str] = DEFAULT_ROOTS) -> str:
         candidate = os.path.normcase(os.path.abspath(root))

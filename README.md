@@ -221,6 +221,15 @@ must first be restored to their normal library path. Bulk edits are atomic: if
 any selected book has started processing, refresh the list and try again.
 Queue controls only change backlog records, and never rename or delete books.
 
+**Prune missing files** in the Book queue checks every library and book status,
+regardless of the current filters. Pause the crawl and queue and wait for active
+work to finish first. The preview shows missing-record counts by status and up
+to20 paths; confirm to remove those records. It never deletes files. Unavailable
+libraries and files that cannot be checked are kept. If a file reappears or the
+queue changes, preview again. Prior events remain in history with an audit note
+for each removed record. Current queue counts refresh; Found/Eligible scan totals
+remain historical. A renamed file is still a new entry when a scan discovers it.
+
 Queue selection uses two FIFO tiers so short work is not trapped behind unusually
 large batches. Books with more than 350 supported image pages, and every book in
 a series directory containing more than 6 known CBZs, run only after all ordinary

@@ -187,6 +187,27 @@ export async function getLibraryBacklog(): Promise<LibraryBacklogStatus> {
     return backlogRequest() as Promise<LibraryBacklogStatus>;
 }
 
+export interface LibraryPrunePreview {
+    missing_count: number;
+    removed_count: number;
+    by_state: Record<string, number>;
+    kept_count: number;
+    unverified_count: number;
+    unavailable_roots: Array<{ root: string; error: string }>;
+    snapshot_digest: string;
+    samples: Array<{ source_path: string; state: string }>;
+}
+
+/** Preview all statuses, or apply exactly the snapshot the operator reviewed. */
+export async function pruneMissingLibraryBooks(preview?: LibraryPrunePreview): Promise<LibraryPrunePreview> {
+    return backlogRequest('/books/prune-missing', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(preview
+            ? { dry_run: false, expected_count: preview.missing_count, snapshot_digest: preview.snapshot_digest }
+            : { dry_run: true })
+    }) as Promise<LibraryPrunePreview>;
+}
+
 export async function getLibraryBookProgress(sourcePath: string): Promise<LibraryBookProgress> {
     return backlogRequest(`/book-progress?source_path=${encodeURIComponent(sourcePath)}`) as Promise<LibraryBookProgress>;
 }
