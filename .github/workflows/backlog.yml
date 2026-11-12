@@ -13,7 +13,6 @@ jobs:
     runs-on: windows-latest
     env:
       PYTHONIOENCODING: utf-8
-      CAMELIA_BACKLOG_DATABASE: ${{ runner.temp }}\camelia-api-test.sqlite3
       CAMELIA_COMIC_AUTOMATION_DATABASE: ''
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +27,7 @@ jobs:
           New-Item -ItemType Directory -Force $fixtureRoot | Out-Null
           $env:TMP = $fixtureRoot
           $env:TEMP = $fixtureRoot
+          $env:CAMELIA_BACKLOG_DATABASE = Join-Path $fixtureRoot 'api-test.sqlite3'
           python -m unittest discover -s tests -p test_backlog_prune.py -v
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python -m unittest discover -s tests -p test_library_backlog.py -v
