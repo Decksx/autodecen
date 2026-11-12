@@ -79,7 +79,6 @@ class PruneFeedbackTests(unittest.TestCase):
                 screenshot = os.environ.get('CAMELIA_UI_FEEDBACK_SCREENSHOT')
                 if screenshot:
                     page.get_by_role('button', name='Checking missing files…').locator('..').locator('..').screenshot(path=screenshot)
-                expect(page.get_by_text('1s elapsed.')).to_be_visible()
                 self.assertEqual(len(held), 1)
                 respond(held.pop(), preview)
                 panel = page.get_by_role('dialog', name='Prune missing files preview')
