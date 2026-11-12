@@ -229,6 +229,9 @@ libraries and files that cannot be checked are kept. If a file reappears or the
 queue changes, preview again. Prior events remain in history with an audit note
 for each removed record. Current queue counts refresh; Found/Eligible scan totals
 remain historical. A renamed file is still a new entry when a scan discovers it.
+While checking or applying, the panel shows the current operation and elapsed
+seconds. Results scroll into view when ready. Any action error stays visible
+through background refreshes until you try another action.
 
 Queue selection uses two FIFO tiers so short work is not trapped behind unusually
 large batches. Books with more than 350 supported image pages, and every book in
