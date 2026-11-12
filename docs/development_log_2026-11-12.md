@@ -89,3 +89,39 @@ this log is the ninth commit and changes no executable behavior.
 Rollout is pending independent exact-head review and both CI jobs. Restarting
 the actual Camelia backend/frontend remains with David's owning interactive
 session; this work did not deploy or invoke the live prune endpoint.
+
+## Prune request feedback (relay4511, 2026-11-12)
+
+David restarted after the #3 rollout, clicked Prune missing files and could not
+see whether it was working. His later preview reports 6,908 missing records,
+39,140 kept and 0 unverified; the backend preview completed. Codex did not
+start a second live preview, confirm a prune, or change the running checkout.
+
+LibraryQueue now names the active preview/apply phase and displays elapsed
+seconds (indeterminate status, not a percentage). The action remains disabled
+while pending. A finished preview scrolls into view and receives focus. During
+apply, the preview and disabled Pruning button remain visible until completion.
+Action errors survive the five-second queue refresh; loading errors have their
+own state. Timers clear after either outcome and when the component unmounts.
+README documents the feedback. No backend, database or API behavior changed.
+
+Validation uses the built Nitro page, fresh headless Chrome and intercepted API
+fixtures only. The browser test holds preview and apply responses, checks status,
+elapsed time, disabled controls, result viewport/focus, cancel without apply,
+reviewed count/digest, success cleanup and a 409 warning surviving a background
+refresh. It reports no page errors. The workflow runs this check on Chromium
+after the GUI build. A pending-preview screenshot was visually inspected.
+
+The new browser test passes locally (13.219 seconds). Building the base #3
+component e0936a8 with this test fails at the missing Checking missing files
+button. Three separate built-component mutations each fail the browser test:
+clearing action errors during successful polling, removing result focus, and
+omitting apply progress. Component bytes are restored in finally; the SHA-256
+is 5a77a717a71e1b00800f688e4e1074c388c262edbda9098386924a425a104a33.
+The first final run after adding the screenshot failed a redundant exact-1s
+assertion because the counter advanced during capture. That test assumption was
+removed (the positive elapsed-time assertion remains), and the rerun passed.
+External build/test/mutation logs and screenshot use camelia-progress-* in Codex
+scratch. Independent exact-head review and CI remain required. Deployment must
+be coordinated with the owning session so a hot update does not disrupt David's
+current preview or apply operation.

@@ -50,3 +50,10 @@ jobs:
           cache-dependency-path: camelia-ui/package-lock.json
       - run: npm ci
       - run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Built prune feedback behavior
+        run: python ../tests/ui/test_prune_feedback.py
