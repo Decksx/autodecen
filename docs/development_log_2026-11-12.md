@@ -89,3 +89,41 @@ this log is the ninth commit and changes no executable behavior.
 Rollout is pending independent exact-head review and both CI jobs. Restarting
 the actual Camelia backend/frontend remains with David's owning interactive
 session; this work did not deploy or invoke the live prune endpoint.
+
+## Confirmed prune database work (relay4539, 2026-11-12)
+
+David reported that the confirmed prune had been running for about ten minutes.
+Read-only diagnostics at approximately23:47Z found the live checkout still at
+e0936a8, API36888 responsive, queue paused and crawl stopped. Counts and recent
+events showed no committed prune yet. A three-second process sample observed
+3.109 CPU seconds, 420,883 read operations / 1,723,889,971 read bytes and
+1,082,420 write bytes. These are process I/O counters (including cached reads),
+not a physical-disk measurement or an exact prune progress counter. No live DB
+was opened directly, no replacement prune was started and no live file changed.
+
+The schema has no index on events.book_id. Each missing book updates its event
+references and is deleted; the foreign-key check also looks through events.
+With a large unrelated event history this repeatedly scans the table. The fix
+adds CREATE INDEX IF NOT EXISTS events_book_id_idx ON events(book_id) in normal
+BacklogStore initialization. Existing databases acquire it on initialization;
+repeated initialization leaves records/history unchanged. The active request
+cannot benefit from a later code update. Rollout remains with the owning
+session after the current operation settles, avoiding a restart mid-transaction.
+
+Two new tests use a real private SQLite database with 32 missing books, one kept
+file and 12,032 historical events. They bound SQLite VM instructions (not wall
+clock time), check retained/detached history and prune audits/FK validity, and
+emulate an old schema to verify migration and repeated initialization. Both fail
+at e0936a8: apply reports about2,316,000 VM instructions against a200,000 bound;
+an absent-book reference lookup uses36,000 against a1,000 bound. Both pass with
+the index. A separate final fixture reports about4,000 apply instructions and
+EXPLAIN uses SEARCH events USING COVERING INDEX events_book_id_idx. Removing the
+one-line guard is equivalent to the tested base and fails both new tests.
+
+All124 available core/backend checks pass in19.753s, using UTF-8 and private
+CAMELIA_BACKLOG_DATABASE/temp paths. The three model-dependent modules remain
+excluded as already documented for #3; no model dependencies were installed.
+The new scaling checks are wired into Windows backend CI. No GUI executable
+change. Independent exact-head review and CI remain required. Source/tests/CI
+are three one-file commits through4f66463; this fourth commit records evidence.
+Board157 tracks the fix separately from frontend feedback PR4/board156.
