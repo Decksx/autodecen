@@ -41,13 +41,17 @@
                 <button class="queue-button" :disabled="busy || !selectedQueued" @click="act('normal')">Use normal order</button>
                 <button class="queue-button" :disabled="busy || !selectedQueued" @click="act('hold')">Hold selected</button>
                 <button class="queue-button" :disabled="busy || !selectedHeld" @click="act('release')">Return selected to queue</button>
-                <button class="queue-button" :disabled="loading || busy" @click="previewPrune">Prune missing files</button>
+                <button class="queue-button" :disabled="loading || busy" @click="previewPrune">{{ prunePhase === 'preview' ? 'Checking missing files…' : 'Prune missing files' }}</button>
                 <button class="queue-button ml-auto" :disabled="loading || busy" @click="load()">Refresh</button>
             </div>
-            <p v-if="error" role="alert" class="text-sm text-love">{{ error }}</p>
+            <p v-if="error || loadError" role="alert" class="text-sm text-love">{{ error || loadError }}</p>
             <p v-if="notice" role="status" class="text-sm text-foam">{{ notice }}</p>
+            <p v-if="prunePhase" role="status" class="text-sm text-foam">
+                {{ prunePhase === 'preview' ? 'Checking every record for missing files.' : 'Rechecking and pruning missing-file records.' }}
+                This can take a few minutes. <span aria-hidden="true">{{ pruneSeconds }}s elapsed.</span>
+            </p>
 
-            <div v-if="prunePreview" role="dialog" aria-label="Prune missing files preview" class="rounded border border-overlay bg-surface p-4 space-y-3 text-sm text-text">
+            <div v-if="prunePreview" ref="prunePanel" tabindex="-1" role="dialog" aria-label="Prune missing files preview" class="rounded border border-overlay bg-surface p-4 space-y-3 text-sm text-text">
                 <h4 class="font-medium text-foam">Remove {{ prunePreview.missing_count }} missing-file records?</h4>
                 <p>This covers all libraries and book statuses, regardless of the filters above. Files are never deleted. Last-crawl scan totals stay historical.</p>
                 <p v-for="(count, category) in prunePreview.by_state" :key="category">{{ category }}: {{ count }}</p>
@@ -55,7 +59,7 @@
                 <p v-for="item in prunePreview.unavailable_roots" :key="item.root" class="text-gold break-all">Library unavailable — records kept: {{ item.root }}</p>
                 <details v-if="prunePreview.samples.length"><summary>Preview paths (up to 20)</summary><ul><li v-for="item in prunePreview.samples" :key="item.source_path" class="break-all">{{ item.state }}: {{ item.source_path }}</li></ul></details>
                 <div class="flex gap-2">
-                    <button class="queue-button bg-love text-base" :disabled="busy || !prunePreview.missing_count" @click="applyPrune">Confirm prune</button>
+                    <button class="queue-button bg-love text-base" :disabled="busy || !prunePreview.missing_count" @click="applyPrune">{{ prunePhase === 'apply' ? 'Pruning…' : 'Confirm prune' }}</button>
                     <button class="queue-button" :disabled="busy" @click="prunePreview = null">Cancel</button>
                 </div>
             </div>
@@ -131,7 +135,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { editLibraryQueueBooks, getLibraryQueueBooks, requeueLibraryBook, pruneMissingLibraryBooks } from '@/services/api';
 import type { LibraryQueueBook, LibraryQueueEdit, LibraryQueuePage, ProcessingType, LibraryPrunePreview } from '@/services/api';
 
@@ -148,8 +152,24 @@ const selected = ref<number[]>([]);
 const loading = ref(false);
 const busy = ref(false);
 const error = ref('');
+// Polling must not erase a failed action before the operator can read it.
+const loadError = ref('');
 const notice = ref('');
 const prunePreview = ref<LibraryPrunePreview | null>(null);
+const prunePanel = ref<HTMLElement | null>(null);
+const prunePhase = ref<'preview' | 'apply' | null>(null);
+const pruneSeconds = ref(0);
+let pruneTimer: ReturnType<typeof setInterval> | null = null;
+function endPruneProgress(): void {
+    if (pruneTimer) clearInterval(pruneTimer);
+    pruneTimer = null; prunePhase.value = null;
+}
+function beginPruneProgress(phase: 'preview' | 'apply'): void {
+    endPruneProgress();
+    prunePhase.value = phase; pruneSeconds.value = 0;
+    const started = Date.now();
+    pruneTimer = setInterval(() => { pruneSeconds.value = Math.floor((Date.now() - started) / 1000); }, 1000);
+}
 const editing = ref<LibraryQueueBook | null>(null);
 const automatic = ref(true);
 const selectedMethods = ref<ProcessingType[]>([]);
@@ -186,9 +206,9 @@ async function load(): Promise<void> {
         }
         page.value = result;
         selected.value = selected.value.filter(id => result.items.some(b => b.id === id && ['queued', 'held'].includes(b.state)));
-        error.value = '';
+        loadError.value = '';
     } catch (cause) {
-        if (version === requestVersion) error.value = cause instanceof Error ? cause.message : 'Could not load the queue';
+        if (version === requestVersion) loadError.value = cause instanceof Error ? cause.message : 'Could not load the queue';
     } finally { if (version === requestVersion) loading.value = false; }
 }
 function search(): void { query.value = searchText.value.trim(); offset.value = 0; selected.value = []; void load(); }
@@ -208,18 +228,26 @@ function act(action: LibraryQueueEdit): void {
 }
 async function previewPrune(): Promise<void> {
     busy.value = true; error.value = ''; notice.value = ''; prunePreview.value = null;
-    try { prunePreview.value = await pruneMissingLibraryBooks(); }
+    beginPruneProgress('preview');
+    try {
+        prunePreview.value = await pruneMissingLibraryBooks();
+        await nextTick();
+        prunePanel.value?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        prunePanel.value?.focus({ preventScroll: true });
+    }
     catch (cause) { error.value = cause instanceof Error ? cause.message : 'Could not check missing files'; }
-    finally { busy.value = false; }
+    finally { endPruneProgress(); busy.value = false; }
 }
 function applyPrune(): void {
     const preview = prunePreview.value;
     if (!preview) return;
     void run(async () => {
-        prunePreview.value = null;
-        const result = await pruneMissingLibraryBooks(preview);
-        notice.value = `${result.removed_count} missing-file records removed. No files were deleted.`;
-        editing.value = null;
+        beginPruneProgress('apply');
+        try {
+            const result = await pruneMissingLibraryBooks(preview);
+            notice.value = `${result.removed_count} missing-file records removed. No files were deleted.`;
+            editing.value = null;
+        } finally { prunePreview.value = null; endPruneProgress(); }
     });
 }
 function edit(book: LibraryQueueBook): void {
@@ -242,7 +270,7 @@ onMounted(() => {
     void load();
     timer = setInterval(() => { if (expanded.value && !loading.value && !busy.value && !editing.value) void load(); }, 5000);
 });
-onUnmounted(() => { ++requestVersion; if (timer) clearInterval(timer); });
+onUnmounted(() => { ++requestVersion; if (timer) clearInterval(timer); endPruneProgress(); });
 </script>
 
 <style scoped>
