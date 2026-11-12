@@ -1,0 +1,52 @@
+name: Backlog and GUI checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backlog:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+      CAMELIA_BACKLOG_DATABASE: ${{ runner.temp }}\camelia-api-test.sqlite3
+      CAMELIA_COMIC_AUTOMATION_DATABASE: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install flask flask-cors pillow psutil tzdata
+      - name: Backlog, queue editor and local API tests
+        shell: pwsh
+        run: |
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP 'camelia-fixtures'
+          New-Item -ItemType Directory -Force $fixtureRoot | Out-Null
+          $env:TMP = $fixtureRoot
+          $env:TEMP = $fixtureRoot
+          python -m unittest discover -s tests -p test_backlog_prune.py -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p test_library_backlog.py -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p test_queue_editor.py -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -p test_api_runtime.py -v
+          exit $LASTEXITCODE
+  gui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: camelia-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: camelia-ui/package-lock.json
+      - run: npm ci
+      - run: npm run build
