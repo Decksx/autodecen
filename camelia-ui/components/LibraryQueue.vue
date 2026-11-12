@@ -41,10 +41,24 @@
                 <button class="queue-button" :disabled="busy || !selectedQueued" @click="act('normal')">Use normal order</button>
                 <button class="queue-button" :disabled="busy || !selectedQueued" @click="act('hold')">Hold selected</button>
                 <button class="queue-button" :disabled="busy || !selectedHeld" @click="act('release')">Return selected to queue</button>
+                <button class="queue-button" :disabled="loading || busy" @click="previewPrune">Prune missing files</button>
                 <button class="queue-button ml-auto" :disabled="loading || busy" @click="load()">Refresh</button>
             </div>
             <p v-if="error" role="alert" class="text-sm text-love">{{ error }}</p>
             <p v-if="notice" role="status" class="text-sm text-foam">{{ notice }}</p>
+
+            <div v-if="prunePreview" role="dialog" aria-label="Prune missing files preview" class="rounded border border-overlay bg-surface p-4 space-y-3 text-sm text-text">
+                <h4 class="font-medium text-foam">Remove {{ prunePreview.missing_count }} missing-file records?</h4>
+                <p>This covers all libraries and book statuses, regardless of the filters above. Files are never deleted. Last-crawl scan totals stay historical.</p>
+                <p v-for="(count, category) in prunePreview.by_state" :key="category">{{ category }}: {{ count }}</p>
+                <p>{{ prunePreview.kept_count }} records will be kept. {{ prunePreview.unverified_count }} could not be checked.</p>
+                <p v-for="item in prunePreview.unavailable_roots" :key="item.root" class="text-gold break-all">Library unavailable — records kept: {{ item.root }}</p>
+                <details v-if="prunePreview.samples.length"><summary>Preview paths (up to 20)</summary><ul><li v-for="item in prunePreview.samples" :key="item.source_path" class="break-all">{{ item.state }}: {{ item.source_path }}</li></ul></details>
+                <div class="flex gap-2">
+                    <button class="queue-button bg-love text-base" :disabled="busy || !prunePreview.missing_count" @click="applyPrune">Confirm prune</button>
+                    <button class="queue-button" :disabled="busy" @click="prunePreview = null">Cancel</button>
+                </div>
+            </div>
 
             <div class="max-h-[32rem] overflow-auto rounded border border-overlay" :aria-busy="loading">
                 <table class="w-full text-left text-xs text-text">
@@ -118,8 +132,8 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { editLibraryQueueBooks, getLibraryQueueBooks, requeueLibraryBook } from '@/services/api';
-import type { LibraryQueueBook, LibraryQueueEdit, LibraryQueuePage, ProcessingType } from '@/services/api';
+import { editLibraryQueueBooks, getLibraryQueueBooks, requeueLibraryBook, pruneMissingLibraryBooks } from '@/services/api';
+import type { LibraryQueueBook, LibraryQueueEdit, LibraryQueuePage, ProcessingType, LibraryPrunePreview } from '@/services/api';
 
 defineProps<{ roots: string[] }>();
 const emit = defineEmits<{ changed: []; inspect: [path: string] }>();
@@ -135,6 +149,7 @@ const loading = ref(false);
 const busy = ref(false);
 const error = ref('');
 const notice = ref('');
+const prunePreview = ref<LibraryPrunePreview | null>(null);
 const editing = ref<LibraryQueueBook | null>(null);
 const automatic = ref(true);
 const selectedMethods = ref<ProcessingType[]>([]);
@@ -189,6 +204,22 @@ function act(action: LibraryQueueEdit): void {
     void run(async () => {
         await editLibraryQueueBooks(ids, action);
         notice.value = `${ids.length} book${ids.length === 1 ? '' : 's'} updated.`;
+    });
+}
+async function previewPrune(): Promise<void> {
+    busy.value = true; error.value = ''; notice.value = ''; prunePreview.value = null;
+    try { prunePreview.value = await pruneMissingLibraryBooks(); }
+    catch (cause) { error.value = cause instanceof Error ? cause.message : 'Could not check missing files'; }
+    finally { busy.value = false; }
+}
+function applyPrune(): void {
+    const preview = prunePreview.value;
+    if (!preview) return;
+    void run(async () => {
+        prunePreview.value = null;
+        const result = await pruneMissingLibraryBooks(preview);
+        notice.value = `${result.removed_count} missing-file records removed. No files were deleted.`;
+        editing.value = null;
     });
 }
 function edit(book: LibraryQueueBook): void {
