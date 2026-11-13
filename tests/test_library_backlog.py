@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -99,6 +100,7 @@ class LibraryBacklogTests(unittest.TestCase):
             )
             with store.connect() as db:
                 db.execute("DROP INDEX books_series_idx")
+                db.execute("DROP INDEX books_series_nocase_idx")
                 db.execute("ALTER TABLE books DROP COLUMN archive_page_count")
                 db.execute("ALTER TABLE books DROP COLUMN series_path")
 
@@ -1030,6 +1032,26 @@ class LibraryBacklogTests(unittest.TestCase):
             self.assertEqual(response.json["source_path"], str(archive))
             self.assertEqual(len(response.json["stages"]), 4)
 
+    def test_unexpected_queue_control_failure_answers_in_json(self):
+        """An unhandled error used to return Flask's HTML 500 page, which the
+        UI showed as "Unexpected token '<' ... is not valid JSON" instead of
+        the real cause (here, the lock timeout seen on cancel-current)."""
+        import sqlite3
+
+        import api
+
+        with patch.object(
+            api.library_backlog, "pause_queue",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch.object(api.app.logger, "exception"):
+            response = api.app.test_client().post(
+                "/api/library-backlog/queue/pause",
+                headers={"Origin": "http://localhost:3000"},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()["error"], "OperationalError: database is locked")
+
     def test_refused_crawl_start_is_saved_in_event_history(self):
         import api
 
@@ -1246,6 +1268,46 @@ class LibraryBacklogTests(unittest.TestCase):
             self.assertTrue(any(event["event_type"] == "job_complete" for event in snapshot["events"]))
             manager.pause_queue()
             manager._queue_thread.join(timeout=2)
+
+
+class ClaimQueryPlanTests(unittest.TestCase):
+    def test_claim_series_count_uses_an_index_instead_of_scanning_books(self):
+        """claim_job holds the write lock while it searches, so a full scan per
+        queued book (~80s on a 39k-book library) made every queue control
+        button fail with "database is locked". Capture the SQL claim_job
+        actually runs and require every series count to be an index search."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archives = [root / f"Series {number}" / "Book.cbz" for number in range(3)]
+            for archive in archives:
+                make_cbz(archive)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            for archive in archives:
+                store.record_archive(
+                    scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility
+                )
+
+            statements = []
+            native_connect = store.connect
+
+            @contextmanager
+            def traced_connect():
+                with native_connect() as db:
+                    db.set_trace_callback(statements.append)
+                    yield db
+
+            with patch.object(store, "connect", traced_connect):
+                self.assertIsNotNone(store.claim_job())
+
+            series_queries = [sql for sql in statements if "related.series_path" in sql]
+            self.assertTrue(series_queries)
+            with store.connect() as db:
+                for sql in series_queries:
+                    plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + sql)]
+                    self.assertFalse(
+                        [step for step in plan if step.startswith("SCAN related")], plan
+                    )
 
 
 if __name__ == "__main__":
