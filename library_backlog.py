@@ -565,6 +565,15 @@ class BacklogStore:
             # cheaply populate directory identity for old rows. Page counts
             # are filled lazily.
             db.execute("CREATE INDEX IF NOT EXISTS books_series_idx ON books(root_path, series_path)")
+            # claim_job counts series members case-insensitively while it
+            # holds the write lock. A BINARY index cannot serve COLLATE NOCASE
+            # lookups, so without this one each claim rescans the whole index
+            # per queued book (~80s on 39k books) and every control button
+            # times out on "database is locked" in the meantime.
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS books_series_nocase_idx "
+                "ON books(root_path COLLATE NOCASE, series_path COLLATE NOCASE)"
+            )
             missing_series = db.execute(
                 "SELECT id,source_path FROM books WHERE series_path IS NULL OR series_path=''"
             ).fetchall()

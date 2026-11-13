@@ -80,7 +80,7 @@ export async function processImages(
         body: formData
     });
 
-    const data = (await response.json()) as ApiResponse;
+    const data = (await readJsonResponse(response, 'Failed to process images')) as ApiResponse;
 
     if (!response.ok) {
         throw new Error(data.error || 'Failed to process images');
@@ -176,9 +176,23 @@ export interface LibraryBookProgress {
     }>;
 }
 
+/**
+ * Parse a JSON API reply, turning a non-JSON body (a proxy or server error
+ * page) into a readable error instead of a raw JSON syntax error.
+ */
+async function readJsonResponse(response: Response, fallback: string): Promise<any> {
+    const text = await response.text();
+    try {
+        return JSON.parse(text);
+    } catch {
+        const status = `${response.status} ${response.statusText}`.trim();
+        throw new Error(`${fallback} (HTTP ${status}; the server did not return JSON)`);
+    }
+}
+
 async function backlogRequest(path = '', options?: RequestInit): Promise<any> {
     const response = await fetch(`${API_BASE_URL}/library-backlog${path}`, options);
-    const data = await response.json();
+    const data = await readJsonResponse(response, 'Library backlog request failed');
     if (!response.ok) throw new Error(data.error || 'Library backlog request failed');
     return data;
 }
@@ -321,7 +335,7 @@ export async function listLocalCbzSources(
         })
     });
 
-    const data = await response.json();
+    const data = await readJsonResponse(response, 'Failed to read the local CBZ directory');
     if (!response.ok) {
         throw new Error(data.error || 'Failed to read the local CBZ directory');
     }
@@ -414,7 +428,7 @@ export async function cancelProcessingJob(sessionId: string): Promise<boolean> {
         });
 
         if (!response.ok) {
-            const errorData = await response.json();
+            const errorData = await readJsonResponse(response, 'Failed to cancel processing');
             throw new Error(errorData.error || 'Failed to cancel processing');
         }
 

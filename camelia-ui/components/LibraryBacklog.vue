@@ -76,6 +76,54 @@
             </p>
             <p v-if="actionError" class="text-sm text-love">{{ actionError }}</p>
 
+            <div class="rounded-md bg-base border border-overlay p-4 space-y-3">
+                <h3 ref="progressHeading" class="text-sm text-foam">Archive pass progress</h3>
+                <p class="text-xs text-subtle">A finished pass is only marked applied after the rebuilt CBZ is installed and its method tags are verified. Showing the current and recent jobs; enter a path under "Queue one previously crawled book" to look up another book.</p>
+                <p v-if="!visibleBooks.length" class="text-xs text-subtle">No processed archive progress yet.</p>
+                <div v-for="book in visibleBooks" :key="book.id" class="rounded-md border border-overlay bg-surface p-3 space-y-2">
+                    <div class="flex flex-wrap justify-between gap-2 text-xs">
+                        <span class="text-text break-all">{{ book.source_path }}</span>
+                        <span class="text-foam">
+                            {{ book.state }} · attempt {{ book.attempts }}
+                            <template v-if="book.duration_seconds !== null"> · total {{ formatDuration(book.duration_seconds) }}</template>
+                        </span>
+                    </div>
+                    <div v-if="book.detection_checked_at" class="text-xs text-foam">
+                        Censorship check: {{ book.detected_methods?.length
+                            ? book.detected_methods.map(stageLabel).join(', ')
+                            : 'No reliable type detected — archive unchanged' }}
+                        <span v-if="book.detection_page_count !== null"> · {{ book.detection_page_count }} pages checked</span>
+                        <span v-if="book.detection_duration_seconds !== null"> · {{ formatDuration(book.detection_duration_seconds) }}</span>
+                        <span> · {{ formatLocalTimestamp(book.detection_checked_at) }}</span>
+                        <div v-if="book.detected_methods?.length" class="text-subtle">
+                            {{ book.detected_methods.map(method => `${stageLabel(method)}: ${book.detected_page_counts?.[method] ?? 0} page(s)`).join(' · ') }}
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 lg:grid-cols-4 gap-2">
+                        <div v-for="stage in book.stages" :key="stage.stage" class="rounded border border-overlay px-2 py-1 text-xs"
+                            :class="{ 'text-foam border-foam': stage.state === 'completed', 'text-love border-love': stage.state === 'failed', 'text-gold border-gold': stage.state === 'running' || stage.state === 'passed' }">
+                            <div>{{ stageLabel(stage.stage) }}</div>
+                            <div>{{ stageStatus(stage) }}</div>
+                            <div v-if="stage.started_at" class="mt-1 text-[11px] text-subtle">
+                                Started {{ formatLocalTimestamp(stage.started_at) }}
+                            </div>
+                            <div v-if="stage.passed_at" class="text-[11px] text-subtle">
+                                Finished {{ formatLocalTimestamp(stage.passed_at) }}
+                            </div>
+                        </div>
+                    </div>
+                    <div v-if="book.finalization.length" class="text-xs text-subtle">
+                        <div class="mb-1 text-text">Finalization</div>
+                        <div v-for="phase in book.finalization" :key="phase.phase">
+                            {{ finalizationLabel(phase.phase) }}: {{ phase.state }}
+                            <template v-if="phase.duration_seconds !== null"> · {{ formatDuration(phase.duration_seconds) }}</template>
+                        </div>
+                    </div>
+                    <p v-if="book.last_error" class="text-xs break-all" :class="book.state === 'skipped' ? 'text-subtle' : 'text-love'">{{ book.last_error }}</p>
+                </div>
+            </div>
+
+
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm text-text">
                 <label class="flex items-center gap-2">
                     <input type="checkbox" :checked="status?.known_types_only ?? false"
@@ -152,53 +200,6 @@
                     :disabled="busy || !bookPath.trim()" @click="lookupBook">
                     Show pass progress
                 </button>
-            </div>
-
-            <div class="rounded-md bg-base border border-overlay p-4 space-y-3">
-                <h3 ref="progressHeading" class="text-sm text-foam">Archive pass progress</h3>
-                <p class="text-xs text-subtle">A finished pass is only marked applied after the rebuilt CBZ is installed and its method tags are verified. Showing the current and recent jobs; enter a path above to look up another book.</p>
-                <p v-if="!visibleBooks.length" class="text-xs text-subtle">No processed archive progress yet.</p>
-                <div v-for="book in visibleBooks" :key="book.id" class="rounded-md border border-overlay bg-surface p-3 space-y-2">
-                    <div class="flex flex-wrap justify-between gap-2 text-xs">
-                        <span class="text-text break-all">{{ book.source_path }}</span>
-                        <span class="text-foam">
-                            {{ book.state }} · attempt {{ book.attempts }}
-                            <template v-if="book.duration_seconds !== null"> · total {{ formatDuration(book.duration_seconds) }}</template>
-                        </span>
-                    </div>
-                    <div v-if="book.detection_checked_at" class="text-xs text-foam">
-                        Censorship check: {{ book.detected_methods?.length
-                            ? book.detected_methods.map(stageLabel).join(', ')
-                            : 'No reliable type detected — archive unchanged' }}
-                        <span v-if="book.detection_page_count !== null"> · {{ book.detection_page_count }} pages checked</span>
-                        <span v-if="book.detection_duration_seconds !== null"> · {{ formatDuration(book.detection_duration_seconds) }}</span>
-                        <span> · {{ formatLocalTimestamp(book.detection_checked_at) }}</span>
-                        <div v-if="book.detected_methods?.length" class="text-subtle">
-                            {{ book.detected_methods.map(method => `${stageLabel(method)}: ${book.detected_page_counts?.[method] ?? 0} page(s)`).join(' · ') }}
-                        </div>
-                    </div>
-                    <div class="grid grid-cols-2 lg:grid-cols-4 gap-2">
-                        <div v-for="stage in book.stages" :key="stage.stage" class="rounded border border-overlay px-2 py-1 text-xs"
-                            :class="{ 'text-foam border-foam': stage.state === 'completed', 'text-love border-love': stage.state === 'failed', 'text-gold border-gold': stage.state === 'running' || stage.state === 'passed' }">
-                            <div>{{ stageLabel(stage.stage) }}</div>
-                            <div>{{ stageStatus(stage) }}</div>
-                            <div v-if="stage.started_at" class="mt-1 text-[11px] text-subtle">
-                                Started {{ formatLocalTimestamp(stage.started_at) }}
-                            </div>
-                            <div v-if="stage.passed_at" class="text-[11px] text-subtle">
-                                Finished {{ formatLocalTimestamp(stage.passed_at) }}
-                            </div>
-                        </div>
-                    </div>
-                    <div v-if="book.finalization.length" class="text-xs text-subtle">
-                        <div class="mb-1 text-text">Finalization</div>
-                        <div v-for="phase in book.finalization" :key="phase.phase">
-                            {{ finalizationLabel(phase.phase) }}: {{ phase.state }}
-                            <template v-if="phase.duration_seconds !== null"> · {{ formatDuration(phase.duration_seconds) }}</template>
-                        </div>
-                    </div>
-                    <p v-if="book.last_error" class="text-xs break-all" :class="book.state === 'skipped' ? 'text-subtle' : 'text-love'">{{ book.last_error }}</p>
-                </div>
             </div>
 
             <p v-if="refreshError" class="text-sm text-love">{{ refreshError }}</p>
