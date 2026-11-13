@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from urllib.parse import urlsplit
 from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 from PIL import Image, ImageCms
 from library_backlog import (
@@ -37,6 +38,16 @@ from aletheia_integration import validate_aletheia_runtime
 
 app = Flask(__name__, static_folder=None)
 CORS(app)  # Enable CORS for all routes
+
+
+@app.errorhandler(Exception)
+def _json_api_error(exc):
+    """Answer unexpected API failures in JSON so the UI can show the cause."""
+    if isinstance(exc, HTTPException) or not request.path.startswith('/api/'):
+        return exc
+    app.logger.exception("Exception on %s [%s]", request.path, request.method)
+    return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
 
 WORKSPACE_ROOT = os.path.dirname(os.path.abspath(__file__))
 CAMELIA_TEMP = os.path.join(WORKSPACE_ROOT, "camelia-decensor", "temp")
