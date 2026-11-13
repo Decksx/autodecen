@@ -535,6 +535,7 @@ class BacklogStore:
                     message TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS events_book_id_idx ON events(book_id);
                 CREATE TABLE IF NOT EXISTS controls (
                     name TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
