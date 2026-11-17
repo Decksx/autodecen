@@ -1668,7 +1668,15 @@ class SingleBookRunTests(unittest.TestCase):
             db.execute("UPDATE books SET state='held' WHERE id=?", (self.ids[2],))
             db.execute("UPDATE books SET state='failed' WHERE id=?", (self.ids[3],))
         self.manager = None
+        root_patch = patch('library_backlog.SCHEDULE_ROOT', str(self.root))
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
         self.addCleanup(self.stop_worker)
+
+    def manager_for(self, processor, **options):
+        options.setdefault('sync_callback', lambda: None)
+        options.setdefault('prepare_callback', lambda job: None)
+        return LibraryBacklog(self.store, processor, **options)
 
     def stop_worker(self):
         if self.manager:
@@ -1681,7 +1689,7 @@ class SingleBookRunTests(unittest.TestCase):
             return {r['id']: dict(r) for r in db.execute('SELECT * FROM books')}
 
     def run_pilot(self, processor, **options):
-        self.manager = LibraryBacklog(self.store, processor, **options)
+        self.manager = self.manager_for(processor, **options)
         with patch.object(self.store, 'retry_failed', side_effect=AssertionError('failed jobs retried')):
             self.manager.run_one_book(self.ids[1])
             self.manager._queue_thread.join(timeout=2)
@@ -1690,6 +1698,7 @@ class SingleBookRunTests(unittest.TestCase):
                 self.fail('single-book worker did not stop')
         self.assertEqual(self.store.queue_control(), 'paused')
         self.assertFalse(self.store.scheduled_autostart())
+        self.assertIsNone(self.manager.single_book_id())
         rows = self.rows()
         for book, state in ((self.ids[0], 'queued'), (self.ids[2], 'held'), (self.ids[3], 'failed')):
             self.assertEqual((rows[book]['state'], rows[book]['attempts']), (state, 0))
@@ -1702,15 +1711,19 @@ class SingleBookRunTests(unittest.TestCase):
 
     def test_named_book_uses_registration_backup_and_handoff_without_touching_others(self):
         events = []
+        def observe(event):
+            self.assertEqual(self.store.queue_control(), 'paused')
+            self.assertEqual(self.manager.single_book_id(), self.ids[1])
+            events.append(event)
         def backup(job, result):
-            events.append('backup-after' if result else 'backup-before' if job else 'pending-backups')
+            observe('backup-after' if result else 'backup-before' if job else 'pending-backups')
         def process(*args):
-            events.append('process')
+            observe('process')
             return self.complete(*args)
         with patch('library_backlog.SCHEDULE_ROOT', str(self.root)):
             rows = self.run_pilot(process, backup_callback=backup,
-                prepare_callback=lambda job: events.append('register'),
-                sync_callback=lambda: events.append('handoff'))
+                prepare_callback=lambda job: observe('register'),
+                sync_callback=lambda: observe('handoff'))
         self.assertEqual(rows[self.ids[1]]['state'], 'completed')
         self.assertEqual(rows[self.ids[1]]['attempts'], 1)
         self.assertEqual(events, ['pending-backups','handoff','backup-before','register','process','backup-after','handoff'])
@@ -1729,7 +1742,8 @@ class SingleBookRunTests(unittest.TestCase):
         for mode in ('model','detector','backup-before','backup-after','register','handoff-before','handoff-after','claim','missing','changed','empty'):
             with self.subTest(mode=mode):
                 with self.store.connect() as db:
-                    db.execute("UPDATE books SET state='queued',attempts=0,archive_page_count=1 WHERE id=?", (self.ids[1],))
+                    db.execute("UPDATE books SET state='queued',attempts=0,archive_page_count=1,source_path=?,root_path=?,source_key=? WHERE id=?",
+                               (str(self.paths[1]),str(self.root),os.path.normcase(os.path.abspath(self.paths[1])),self.ids[1]))
                 make_cbz(self.paths[1])
                 stat = self.paths[1].stat()
                 with self.store.connect() as db:
@@ -1752,8 +1766,10 @@ class SingleBookRunTests(unittest.TestCase):
                 def claim(**kwargs):
                     return fail() if mode == 'claim' else original_claim(**kwargs)
                 with patch('library_backlog.SCHEDULE_ROOT', str(self.root)), patch.object(self.store,'claim_job',side_effect=claim):
-                    self.run_pilot(processor, detector=lambda *_: fail(), backup_callback=backup,
+                    rows = self.run_pilot(processor, detector=lambda *_: fail(), backup_callback=backup,
                         prepare_callback=lambda _: fail() if mode == 'register' else None, sync_callback=handoff)
+                    row = rows[self.ids[1]]
+                    self.assertEqual(row['source_key'], os.path.normcase(os.path.abspath(row['source_path'])))
 
     def test_requeued_selected_id_is_not_claimed_a_second_time(self):
         calls = []
@@ -1761,6 +1777,7 @@ class SingleBookRunTests(unittest.TestCase):
             calls.append('handoff')
             if len(calls) == 2:
                 self.store.requeue_book(str(self.paths[1]), ['black_bars'], reprocess=True, automatic=False)
+                self.manager.resume_queue(retry_failed=False)
         rows = self.run_pilot(self.complete, sync_callback=handoff)
         self.assertEqual(len(calls), 2)
         self.assertEqual(rows[self.ids[1]]['state'], 'queued')
@@ -1775,7 +1792,7 @@ class SingleBookRunTests(unittest.TestCase):
         self.assertEqual((rows[self.ids[1]]['state'], rows[self.ids[1]]['attempts']), ('held', 0))
 
     def test_invalid_identity_state_schedule_or_worker_is_refused_without_start(self):
-        manager = LibraryBacklog(self.store, lambda *_: self.fail('refused request ran'))
+        manager = self.manager_for(lambda *_: self.fail('refused request ran'))
         self.manager = manager
         for value in (True, None, '2', 1.2, 0, -1, 999999, self.ids[2], self.ids[3]):
             with self.subTest(value=value), self.assertRaises(ValueError): manager.run_one_book(value)
@@ -1790,17 +1807,21 @@ class SingleBookRunTests(unittest.TestCase):
         self.assertIsNone(manager._queue_thread)
 
     def test_thread_start_failure_leaves_queue_paused(self):
-        manager = LibraryBacklog(self.store, self.complete)
-        for target in ('library_backlog.threading.Thread.start','library_backlog.threading.Thread'):
-            with self.subTest(target=target):
-                self.store.control_queue('paused')
-                with patch(target, side_effect=RuntimeError('no worker')):
-                    with self.assertRaisesRegex(RuntimeError, 'no worker'): manager.run_one_book(self.ids[1])
-                self.assertEqual(self.store.queue_control(), 'paused')
-                self.assertIsNone(manager._queue_thread)
+        manager = self.manager_for(self.complete)
+        for mode in ('one','normal'):
+            for target in ('library_backlog.threading.Thread.start','library_backlog.threading.Thread'):
+                with self.subTest(target=target,mode=mode):
+                    self.store.control_queue('paused')
+                    with patch(target, side_effect=RuntimeError('no worker')):
+                        with self.assertRaisesRegex(RuntimeError, 'no worker'):
+                            if mode == 'one': manager.run_one_book(self.ids[1])
+                            else: manager.resume_queue(retry_failed=False)
+                    self.assertEqual(self.store.queue_control(), 'paused')
+                    self.assertIsNone(manager._queue_thread)
+                    self.assertIsNone(manager.single_book_id())
 
     def test_retired_ambiguous_and_exhausted_identity_are_refused_without_archive_io(self):
-        manager = LibraryBacklog(self.store, self.complete)
+        manager = self.manager_for(self.complete)
         self.manager = manager
         with self.store.connect() as db:
             db.execute('UPDATE books SET root_path=? WHERE id=?', (r'Z:\comics\Comix',self.ids[1]))
@@ -1822,7 +1843,7 @@ class SingleBookRunTests(unittest.TestCase):
             entered.set()
             self.assertTrue(release.wait(2))
             return self.complete(*args)
-        self.manager = LibraryBacklog(self.store, processor)
+        self.manager = self.manager_for(processor)
         self.manager.run_one_book(self.ids[1])
         try:
             self.assertTrue(entered.wait(2))
@@ -1841,7 +1862,7 @@ class SingleBookRunTests(unittest.TestCase):
             if result:
                 finishing.set()
                 self.assertTrue(release.wait(2))
-        self.manager = LibraryBacklog(self.store, self.complete, backup_callback=backup)
+        self.manager = self.manager_for(self.complete, backup_callback=backup)
         self.manager.run_one_book(self.ids[1])
         try:
             self.assertTrue(finishing.wait(2))
@@ -1861,13 +1882,29 @@ class SingleBookRunTests(unittest.TestCase):
                 with self.subTest(options=options), self.assertRaises(ValueError): manager.run_one_book(self.ids[1])
         self.assertEqual(self.store.queue_control(), 'paused')
 
+    def test_named_run_refuses_other_roots_outside_sources_and_excluded_trees(self):
+        manager = self.manager_for(self.complete)
+        self.manager = manager
+        for root, source in ((str(self.root.parent / 'other'),str(self.paths[1])),
+                             (str(self.root),str(self.root.parent / 'outside.cbz')),
+                             (str(self.root),str(self.root / '.stversions' / 'Book.cbz'))):
+            with self.subTest(root=root,source=source):
+                with self.store.connect() as db:
+                    db.execute('UPDATE books SET root_path=?,source_path=? WHERE id=?', (root,source,self.ids[1]))
+                with self.assertRaisesRegex(ValueError, 'active library'): manager.run_one_book(self.ids[1])
+        self.assertIsNone(manager._queue_thread)
+        self.assertEqual(self.store.queue_control(), 'paused')
+
     def test_local_api_validates_one_book_body_and_never_uses_resume(self):
         import api
         from unittest.mock import Mock
         fake = Mock()
+        fake.store.snapshot.return_value = self.store.snapshot()
+        fake.single_book_id.return_value = self.ids[1]
         client = api.app.test_client()
         client.environ_base['HTTP_ORIGIN'] = 'http://localhost:3000'
         with patch.object(api, 'library_backlog', fake):
+            self.assertEqual(client.get('/api/library-backlog').json.get('single_book_id'), self.ids[1])
             response = client.post('/api/library-backlog/queue/one', json={'book_id':self.ids[1]})
             self.assertEqual(response.status_code, 200)
             fake.run_one_book.assert_called_once_with(self.ids[1])
