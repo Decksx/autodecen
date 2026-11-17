@@ -39,6 +39,52 @@ def make_cbz(path: Path, comicinfo: str | None = None, *, page_count: int = 1) -
 
 
 class LibraryBacklogTests(unittest.TestCase):
+    def test_history_and_quarantine_components_are_excluded_at_any_depth(self):
+        # Keep this independent list explicit: these trees contain preserved
+        # copies, not new work, even when their archives have no processed tag.
+        names = (
+            ".cbz-canonical-naming", ".cbz-canonical-naming.lock",
+            ".cbz-canonical-naming.owner.json", ".cbz-canonical-quarantine",
+            ".cbz-library-writers.lock", ".cbz-library-writers.owner.json",
+            ".stfolder", ".stignore", ".stversion", ".stversions", "@eadir",
+            "$recycle.bin", "system volume information", "ai-decensor-originals",
+            "ai_decensor_originals", "_processing issues",
+            "_quarantine_superseded_2026-11-13", "_QUARANTINE_other",
+        )
+        root = Path(tempfile.gettempdir()) / "fixture-comix"
+        for name in names:
+            for prefix in (root, root / "Series"):
+                directory = prefix / name.upper()
+                with self.subTest(name=name, prefix=str(prefix)):
+                    self.assertTrue(excluded_library_path(str(directory), str(root), directory=True))
+                    self.assertTrue(excluded_library_path(str(directory / "Book.cbz"), str(root)))
+        for name in ("Quarantine Story", "ai-decensor-originals extra", "_quarantine", "Book.cbz"):
+            with self.subTest(ordinary=name):
+                self.assertFalse(excluded_library_path(str(root / name / "Chapter.cbz"), str(root)))
+
+    def test_a_fresh_crawl_never_queues_preserved_history_archives(self):
+        # Exercise the actual directory traversal, without launching a worker.
+        # Every fixture is eligible, so an exclusion bypass queues an extra row.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            for relative in (
+                ".cbz-canonical-quarantine/Old.cbz",
+                "Series/_quarantine_superseded_2026-11-13/Old.cbz",
+                "AI_Decensor_Originals/Old.cbz",
+                ".stignore/Old.cbz",
+                "Ordinary/Chapter.cbz",
+            ):
+                make_cbz(root / relative)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan = store.start_scan(str(root))
+            backlog = LibraryBacklog(store, lambda *args: None)
+            backlog._crawl(scan, str(root))
+            with store.connect() as db:
+                rows = db.execute("SELECT source_path,state FROM books").fetchall()
+            self.assertEqual([(row["source_path"], row["state"]) for row in rows],
+                             [(str(root / "Ordinary" / "Chapter.cbz"), "queued")])
+            self.assertEqual(store.queue_control(), "paused")
+
     def test_discovery_counts_image_pages_without_counting_auxiliary_files(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "Book.cbz"
