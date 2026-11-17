@@ -568,9 +568,14 @@ class BacklogStore:
                 ("archive_page_count", "INTEGER"),
                 ("series_path", "TEXT"),
                 ("queue_priority", "INTEGER NOT NULL DEFAULT 0"),
+                ("source_key", "TEXT"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE books ADD COLUMN {name} {definition}")
+            # Non-unique deliberately: keep historical case-duplicate rows,
+            # refusing ambiguous lookups rather than merging their histories.
+            db.execute("CREATE INDEX IF NOT EXISTS books_source_key_idx ON books(source_key)")
+            self._fill_source_keys(db)
             # Add the index only after migrating existing databases, then
             # cheaply populate directory identity for old rows. Page counts
             # are filled lazily.
@@ -746,20 +751,53 @@ class BacklogStore:
             if error:
                 self._event(db, "scan_error", f"Could not read {directory}: {error}", scan_id=scan_id)
 
+    @staticmethod
+    def _fill_source_keys(db) -> None:
+        """Backfill legacy/older-writer rows inside the caller's transaction."""
+        rows = db.execute("SELECT id,source_path FROM books WHERE source_key IS NULL").fetchall()
+        db.executemany("UPDATE books SET source_key=? WHERE id=?",
+                       [(os.path.normcase(os.path.abspath(row["source_path"])), row["id"]) for row in rows])
+
+    @staticmethod
+    def _source_row(db, normalized: str):
+        """Find one normalized path; verify alternate spellings on the filesystem."""
+        # Older running versions can still insert NULL keys after initialization.
+        # Both this repair and the lookup run under BEGIN IMMEDIATE, so a late
+        # registration cannot slip between the decision and the update/insert.
+        BacklogStore._fill_source_keys(db)
+        key = os.path.normcase(normalized)
+        rows = db.execute("SELECT * FROM books WHERE source_key=? LIMIT 2", (key,)).fetchall()
+        if len(rows) > 1:
+            raise ValueError(f"Ambiguous backlog source records; retained for review: {normalized}")
+        prior = rows[0] if rows else None
+        if prior and prior["source_path"] != normalized:
+            try:
+                same = os.path.samefile(prior["source_path"], normalized)
+            except OSError as exc:
+                raise ValueError(f"Cannot verify backlog source spelling: {normalized}") from exc
+            if not same:
+                raise ValueError(f"Backlog source spellings name different files: {normalized}")
+        return prior
+
+    def _reuse_unchanged(self, db, prior, scan_id: int, normalized: str, stat, now: str) -> bool:
+        """Reuse the same generation without resetting its queue order or history."""
+        if not (prior and prior["eligibility_version"] >= QUEUE_PRIORITY_VERSION
+                and prior["file_size"] == stat.st_size and prior["mtime_ns"] == stat.st_mtime_ns):
+            return False
+        db.execute("UPDATE books SET last_scan_id=?, updated_at=? WHERE id=?", (scan_id, now, prior["id"]))
+        if prior["last_scan_id"] != scan_id:
+            self._increment_scan(db, scan_id, prior["state"], unchanged=True)
+            self._event(db, "scan_unchanged", f"Unchanged archive reused: {normalized}", scan_id=scan_id, book_id=prior["id"])
+        return True
+
     def record_archive(self, scan_id: int, root: str, path: str, stat, inspector: Callable[[str], dict]) -> str:
+        """Inspect/register an archive while retaining one identity for path-case aliases."""
         normalized = os.path.abspath(path)
         now = utc_now()
         with self.connect() as db:
-            prior = db.execute("SELECT * FROM books WHERE source_path=?", (normalized,)).fetchone()
-            unchanged = (prior and prior["eligibility_version"] >= QUEUE_PRIORITY_VERSION
-                         and prior["file_size"] == stat.st_size and prior["mtime_ns"] == stat.st_mtime_ns)
-            if unchanged:
-                db.execute("UPDATE books SET last_scan_id=?, updated_at=? WHERE id=?", (scan_id, now, prior["id"]))
-                if prior["last_scan_id"] == scan_id:
-                    return "unchanged"
-                state = prior["state"]
-                self._increment_scan(db, scan_id, state, unchanged=True)
-                self._event(db, "scan_unchanged", f"Unchanged archive reused: {normalized}", scan_id=scan_id, book_id=prior["id"])
+            db.execute("BEGIN IMMEDIATE")
+            prior = self._source_row(db, normalized)
+            if self._reuse_unchanged(db, prior, scan_id, normalized, stat, now):
                 return "unchanged"
 
         # ZIP I/O happens outside the write transaction.
@@ -771,7 +809,12 @@ class BacklogStore:
             reason = (f"Pending methods: {', '.join(sequence)}" if sequence else
                       "All decensor methods already recorded")
         with self.connect() as db:
-            prior = db.execute("SELECT id, state FROM books WHERE source_path=?", (normalized,)).fetchone()
+            db.execute("BEGIN IMMEDIATE")
+            prior = self._source_row(db, normalized)
+            if self._reuse_unchanged(db, prior, scan_id, normalized, stat, now):
+                return "unchanged"
+            if prior and prior["state"] == "processing":
+                raise ValueError(f"Source changed while processing; retry after the job finishes: {normalized}")
             if prior and prior["state"] == "held" and sequence:
                 state = "held"
             values = (
@@ -779,7 +822,7 @@ class BacklogStore:
                 inspection.get("title"), json.dumps(inspection.get("tags", [])),
                 reason, state, json.dumps(sequence),
                 now if state == "queued" else None, inspection.get("parse_error"), now,
-                inspection.get("page_count"), os.path.dirname(normalized), normalized,
+                inspection.get("page_count"), os.path.dirname(normalized),
             )
             if prior:
                 # The bytes changed; pass markers from the old archive can no
@@ -793,8 +836,8 @@ class BacklogStore:
                        auto_detect=1, detected_methods=NULL, detected_pages=NULL,
                        detection_checked_at=NULL, detection_duration_seconds=NULL,
                        detection_page_count=NULL, archive_page_count=?, series_path=?
-                       WHERE source_path=?""",
-                    (*values[:12], QUEUE_PRIORITY_VERSION, *values[12:]),
+                       WHERE id=?""",
+                    (*values[:12], QUEUE_PRIORITY_VERSION, *values[12:], prior["id"]),
                 )
                 book_id = prior["id"]
             else:
@@ -802,14 +845,14 @@ class BacklogStore:
                     """INSERT INTO books(source_path,root_path,last_scan_id,file_size,mtime_ns,
                        metadata_title,metadata_tags,eligibility_reason,state,selected_sequence,
                        eligibility_version,queued_at,last_error,discovered_at,updated_at,
-                       archive_page_count,series_path)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       archive_page_count,series_path,source_key)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         normalized, root, scan_id, stat.st_size, stat.st_mtime_ns,
                         inspection.get("title"), json.dumps(inspection.get("tags", [])),
                         reason, state, json.dumps(sequence), QUEUE_PRIORITY_VERSION,
                         now if state == "queued" else None, inspection.get("parse_error"), now, now,
-                        inspection.get("page_count"), os.path.dirname(normalized),
+                        inspection.get("page_count"), os.path.dirname(normalized), os.path.normcase(normalized),
                     ),
                 )
                 book_id = cursor.lastrowid
