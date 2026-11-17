@@ -1669,6 +1669,7 @@ def get_library_backlog():
     status["comic_automation_handoff_configured"] = library_backlog.sync_callback is not None
     status["source_registration_configured"] = library_backlog.prepare_callback is not None
     status["backup_offload_configured"] = library_backlog.backup_callback is not None
+    status["single_book_id"] = library_backlog.single_book_id()
     return jsonify(status)
 
 
