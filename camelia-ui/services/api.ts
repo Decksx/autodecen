@@ -106,6 +106,7 @@ export interface LibraryScanStatus {
 }
 
 export interface LibraryBacklogStatus {
+    single_book_id?: number | null;
     allowed_roots: string[];
     comic_automation_handoff_configured: boolean;
     source_registration_configured: boolean;
