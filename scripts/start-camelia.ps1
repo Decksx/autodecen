@@ -1,7 +1,15 @@
 param(
     [string]$PythonPath = $env:CAMELIA_PYTHON,
+    # ComicAutomation's reviewed inspection catalog. Camelia registers each X:
+    # book there before processing and hands completed books back, and its
+    # X: queue cannot resume without it (docs/camelia_decensor.md in the suite).
+    # An explicit -ComicAutomationDatabase or CAMELIA_COMIC_AUTOMATION_DATABASE
+    # wins; "none" starts Camelia without the handoff.
+    [string]$ComicAutomationDatabase = $env:CAMELIA_COMIC_AUTOMATION_DATABASE,
     [switch]$NoBrowser
 )
+
+$reviewedComicAutomationDatabase = "G:\ComicAutomation\TestDatabase\inspection-working.db"
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -98,6 +106,25 @@ function Resolve-CameliaPython {
     throw "Could not find Python. Set CAMELIA_PYTHON to the full path of the Camelia environment's python.exe."
 }
 
+function Resolve-ComicAutomationDatabase {
+    param([string]$RequestedPath)
+
+    if ($RequestedPath -eq "none") {
+        return ""
+    }
+    $path = if ($RequestedPath) { $RequestedPath } else { $reviewedComicAutomationDatabase }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "ComicAutomation database not found: $path. Pass -ComicAutomationDatabase none to start without the handoff."
+    }
+    $resolved = (Resolve-Path -LiteralPath $path).Path
+    # The older database at G:\ComicAutomation\database\comics.db has only
+    # migrations 001-002 and lacks the handoff's tables; it must not be used.
+    if ($resolved -like "*\ComicAutomation\database\comics.db") {
+        throw "Refusing the old schema database $resolved; use the reviewed inspection catalog."
+    }
+    return $resolved
+}
+
 function Stop-ProcessTree {
     param(
         [System.Diagnostics.Process]$Process,
@@ -165,6 +192,18 @@ try {
 
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     $env:PYTHONUNBUFFERED = "1"
+
+    # Resolved before the API starts, so the API inherits it. A reused API
+    # keeps the setting it was started with.
+    $handoffDatabase = Resolve-ComicAutomationDatabase -RequestedPath $ComicAutomationDatabase
+    if ($handoffDatabase) {
+        $env:CAMELIA_COMIC_AUTOMATION_DATABASE = $handoffDatabase
+        Write-Host "ComicAutomation handoff database: $handoffDatabase"
+    }
+    else {
+        Remove-Item Env:CAMELIA_COMIC_AUTOMATION_DATABASE -ErrorAction SilentlyContinue
+        Write-Host "ComicAutomation handoff disabled; X: queue processing stays unavailable." -ForegroundColor Yellow
+    }
 
     if ($apiPortBusy) {
         Write-Host "Camelia API is already running; reusing it."
