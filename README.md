@@ -181,6 +181,19 @@ The **Library Decensor Backlog** section crawls `X:\comix` recursively.
 Tower's `Z:\comics\Comix` is the receive-only replica after the X: cutover:
 new crawls and resuming an old crawl there are refused. Existing held Z: rows
 and their history remain in the database; this does not migrate or release them.
+Bulk release and manual requeue also refuse the retired `Z:\comics` and
+canonical `\\TOWER\media\comics` trees. Mixed release batches are atomic:
+including one retired row releases none of the selected books. A requeue checks
+again after ZIP inspection, before changing the queue record.
+
+If an old caller or restart leaves a retired job queued, claiming holds it before
+any priority-classification ZIP read, backup, model work or attempt increment.
+Its cache, stage history and queue priority remain intact; a `retired_root_hold`
+event explains the hold, and other jobs continue. Root preflight ignores these
+replicas rather than probing them. Both root and source paths are checked,
+including case/slash/extended-length spellings. This retirement list covers the
+known cutover paths, not every possible SMB alias or a remapped drive; additional
+aliases need policy review. No archive is moved or deleted by these checks.
 The crawler reads the filename and
 `ComicInfo.xml` directly from each CBZ. Generic `uncensored`/`decensored`
 markers without method tags are skipped, while books with method tags are
