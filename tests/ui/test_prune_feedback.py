@@ -130,7 +130,7 @@ class PruneFeedbackTests(unittest.TestCase):
                 ready = dict(backup_offload_configured=True,
                              comic_automation_handoff_configured=True, source_registration_configured=True)
                 gates = [{key:False} for key in ready]
-                gates += [dict(queue_status='running'), dict(counts=dict(counts,processing=1)),
+                gates += [dict(queue_status='running'), dict(single_book_id=42), dict(counts=dict(counts,processing=1)),
                           dict(batch_schedule={'enabled':True,'auto_resume':False,'in_window':False})]
                 for gate in gates:
                     readiness.clear(); readiness.update(ready); readiness.update(gate)
