@@ -27,7 +27,9 @@ from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger(__name__)
 PROCESSED_MARKERS = ("uncensored", "decensored")
-DEFAULT_ROOTS = (r"X:\comix", r"Z:\comics\Comix")
+# Tower is now the receive-only replica. Keep its existing rows as history,
+# but never offer or validate it as a new/resumed crawl destination.
+DEFAULT_ROOTS = (r"X:\comix",)
 EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".stversions", ".stversion", ".stfolder", ".stignore", "@eadir",
     "$recycle.bin", "system volume information",
