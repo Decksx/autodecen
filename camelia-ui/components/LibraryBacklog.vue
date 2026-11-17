@@ -227,7 +227,9 @@ import {
 import type { LibraryBacklogStatus, LibraryBookProgress, ProcessingType } from '@/services/api';
 import LibraryQueue from '@/components/LibraryQueue.vue';
 
-const fallbackRoots = ['X:\\comix', 'Z:\\comics\\Comix'];
+// Used only until the server reports allowed_roots. X: only: Tower's
+// Z:\comics\Comix is the receive-only replica, and the API refuses it.
+const fallbackRoots = ['X:\\comix'];
 const status = ref<LibraryBacklogStatus | null>(null);
 const selectedRoot = ref(fallbackRoots[0]);
 const busy = ref(false);
