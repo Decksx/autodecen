@@ -255,7 +255,7 @@ const scan = computed(() => status.value?.scan ?? null);
 // cannot compete with an active worker or an automatic batch schedule.
 const canRunOne = computed(() => {
     const current = status.value;
-    return !!current && !busy.value && current.queue_status !== 'running'
+    return !!current && !busy.value && current.queue_status !== 'running' && current.single_book_id == null
         && current.counts.processing === 0 && !current.batch_schedule.enabled
         && current.backup_offload_configured && current.comic_automation_handoff_configured
         && current.source_registration_configured;
