@@ -258,6 +258,32 @@ Old held records remain separate history when the same collection is crawled
 through a new root. A new path does not inherit their detection caches or stage
 evidence; archive method tags determine which passes remain necessary.
 
+Archive registration uses an indexed `source_key` based on the host's absolute
+path and `os.path.normcase`. Windows case-only spellings reuse the original book
+ID, stored path, queue position and same-generation history. An alternate spelling
+must also name the same physical file; an unavailable or different file is refused.
+This does not combine mount aliases or unrelated hard-link paths. The unchanged
+generation check is still size/mtime metadata, not a content-hash guarantee.
+
+Before the first open on upgraded code, stop registration writers and verify a
+database backup: `BacklogStore` initialization backfills every existing key
+(39,140 rows measured in the pre-upgrade snapshot on 2026-11-17 UTC).
+It does not merge old duplicate rows.
+Ambiguous keys are retained and archive registration refuses
+them for review. Each registration lookup and its update/insert share a write
+transaction; ZIP inspection runs outside it, followed by a fresh lookup. A row
+registered during inspection is reused without resetting its queue order, and a
+changed archive currently being processed is refused. Both matching and NULL-key
+repair use the key index. NULL keys left by an older writer before a lookup are
+filled during that lookup; older writers do not enforce the new policy, so restart
+all registration writers with the updated code before concurrent crawling.
+
+`RegistrationRefused` is a recoverable per-archive outcome. A crawl records a
+`scan_refused` event and increments `scans.refused_count`, leaving that archive's
+records intact and continuing to later books. Refusals count as found/scanned,
+not eligible or skipped. An unrelated error still fails the scan. Alias-reuse
+events name both the incoming spelling and the retained queue path.
+
 Eligible books run sequentially through `black_bars`, `transparent_black`,
 `white_bars`, and detector-gated Aletheia-Lens `mosaic` restoration using the
 same shared pipeline as manual processing. The source is
