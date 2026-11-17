@@ -65,12 +65,88 @@ class LibraryBacklogTests(unittest.TestCase):
             with store.connect() as db:
                 rows = db.execute("SELECT * FROM books").fetchall()
                 stage = db.execute("SELECT state FROM book_stages WHERE stage='black_bars'").fetchone()[0]
+                alias_message = db.execute("SELECT message FROM events WHERE event_type='source_alias_reused'").fetchone()[0]
             self.assertEqual(result, "unchanged")
             self.assertEqual(len(rows), 1)
             self.assertEqual((rows[0]["id"], rows[0]["source_path"], rows[0]["state"], rows[0]["queue_priority"], rows[0]["queued_at"]),
                              (1, str(book), "held", 77, "earlier"))
             self.assertEqual(rows[0]["detected_methods"], '["black_bars"]')
             self.assertEqual(stage, "completed")
+            self.assertIn(str(book), alias_message)
+            self.assertIn(str(alias), alias_message)
+
+    @unittest.skipUnless(os.name == "nt", "Windows case-insensitive path spellings")
+    def test_crawl_counts_registration_refusals_and_continues_to_later_books(self):
+        for refusal in ("ambiguous", "different", "unverifiable", "processing"):
+            with self.subTest(refusal=refusal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "Comix"
+                for name in ("a.cbz", "b.cbz", "c.cbz"):
+                    make_cbz(root / "Series" / name)
+                store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+                b = root / "Series" / "b.cbz"
+                spellings = [str(b), str(b.with_name("B.CBZ"))] if refusal == "ambiguous" else [
+                    str(b) if refusal == "processing" else str(b.with_name("B.CBZ"))]
+                with store.connect() as db:
+                    for path in spellings:
+                        cursor = db.execute("""INSERT INTO books(source_path,root_path,file_size,mtime_ns,state,
+                            selected_sequence,discovered_at,updated_at) VALUES(?,?,1,1,?,'[]','earlier','earlier')""",
+                                            (path, str(root), "processing" if refusal == "processing" else "held"))
+                        store._event(db, "fixture_history", "retained", book_id=cursor.lastrowid)
+                scan = store.start_scan(str(root))
+                options = {"side_effect": OSError("unreadable")} if refusal == "unverifiable" else {"return_value": False}
+                # Only alternate-spelling cases call samefile; no real model
+                # work or thread is launched by this synchronous crawl.
+                with patch("library_backlog.os.path.samefile", **options):
+                    LibraryBacklog(store, lambda *args: None)._crawl_guarded(scan, str(root))
+                with store.connect() as db:
+                    queued = {Path(row[0]).name for row in db.execute("SELECT source_path FROM books WHERE state='queued'")}
+                    events = db.execute("SELECT message FROM events WHERE event_type='scan_refused'").fetchall()
+                    historical = db.execute("SELECT COUNT(*) FROM events WHERE event_type='fixture_history'").fetchone()[0]
+                    status = db.execute("SELECT * FROM scans WHERE id=?", (scan,)).fetchone()
+                self.assertEqual(queued, {"a.cbz", "c.cbz"})
+                self.assertEqual(len(events), 1)
+                self.assertIn("b.cbz", events[0][0])
+                self.assertEqual(historical, len(spellings))
+                self.assertEqual(status["status"], "completed")
+                self.assertEqual((status["total_found"], status["scanned_count"], status["eligible_count"], status["refused_count"]),
+                                 (3, 3, 2, 1))
+
+    def test_unexpected_registration_value_error_still_fails_the_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Comix"
+            for name in ("a.cbz", "b.cbz", "c.cbz"):
+                make_cbz(root / name)
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan = store.start_scan(str(root))
+            original = inspect_cbz_eligibility
+
+            def inspector(path):
+                if Path(path).name == "b.cbz":
+                    raise ValueError("unexpected inspector failure")
+                return original(path)
+
+            with patch("library_backlog.inspect_cbz_eligibility", side_effect=inspector):
+                LibraryBacklog(store, lambda *args: None)._crawl_guarded(scan, str(root))
+            self.assertEqual(store.scan_status(scan), "failed")
+            with store.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM books").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT refused_count FROM scans WHERE id=?", (scan,)).fetchone()[0], 0)
+
+    def test_legacy_scan_gets_a_zero_refusal_counter_without_losing_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "state" / "backlog.sqlite3")
+            store = BacklogStore(database)
+            scan = store.start_scan(str(Path(directory) / "Comix"))
+            store.set_scan_status(scan, "completed", "fixture complete")
+            with store.connect() as db:
+                db.execute("UPDATE scans SET total_found=9,scanned_count=9 WHERE id=?", (scan,))
+                db.execute("ALTER TABLE scans DROP COLUMN refused_count")
+            reopened = BacklogStore(database)
+            with reopened.connect() as db:
+                row = db.execute("SELECT * FROM scans WHERE id=?", (scan,)).fetchone()
+            self.assertIn("refused_count", row.keys())
+            self.assertEqual((row["status"], row["total_found"], row["scanned_count"], row["refused_count"]),
+                             ("completed", 9, 9, 0))
 
     @unittest.skipUnless(os.name == "nt", "Windows case-insensitive path spellings")
     def test_changed_case_alias_updates_the_original_row_and_invalidates_cache(self):
