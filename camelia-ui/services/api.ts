@@ -246,6 +246,14 @@ export async function controlLibraryQueue(action: 'pause' | 'resume' | 'stop' | 
     await backlogRequest(`/queue/${action}`, { method: 'POST' });
 }
 
+/** Run only this queued identity through the normal pipeline, then pause. */
+export async function runOneLibraryBook(bookId: number): Promise<void> {
+    await backlogRequest('/queue/one', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ book_id: bookId })
+    });
+}
+
 export async function controlLibraryDetectionMode(enabled: boolean): Promise<void> {
     await backlogRequest('/known-types-only', {
         method: 'POST',
