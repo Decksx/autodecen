@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import ntpath
 import os
 import sqlite3
 import threading
@@ -55,6 +56,26 @@ PROCESSING_ISSUES_DIRECTORY = "_processing issues"
 
 class RegistrationRefused(ValueError):
     """One archive cannot be registered safely; the crawl may continue past it."""
+
+
+def retired_replica_path(path: str) -> bool:
+    """Recognize the retired mapped/canonical Tower comics trees without I/O.
+
+    Discovery already accepts only X:\\comix. This also protects historical
+    rows and old callers; it is not a resolver for every possible SMB alias.
+    """
+    normalized = ntpath.normcase(ntpath.normpath(os.fspath(path)))
+    if normalized.startswith("\\\\?\\unc\\"):
+        normalized = "\\\\" + normalized[8:]
+    elif normalized.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return any(normalized == root or normalized.startswith(root + "\\")
+               for root in (r"z:\comics", r"\\tower\media\comics"))
+
+
+def _retired_book(row) -> bool:
+    """Either stored field can retain an old replica path during a partial move."""
+    return retired_replica_path(row["root_path"]) or retired_replica_path(row["source_path"])
 
 
 def _filesystem_path(path: str) -> str:
@@ -961,7 +982,7 @@ class BacklogStore:
                      AND (? IS NULL OR root_path = ? COLLATE NOCASE)
                      AND (? IS NULL OR root_path <> ? COLLATE NOCASE)""",
                 (int(include_failed), root_path, root_path, exclude_root, exclude_root),
-            )]
+            ) if not retired_replica_path(row["root_path"])]
 
     def control_scheduled_autostart(self, enabled: bool) -> None:
         with self.connect() as db:
@@ -995,7 +1016,10 @@ class BacklogStore:
                     "ORDER BY queue_priority DESC, queued_at, id LIMIT 1", parameters,
                 ).fetchone()
                 if promoted is not None:
-                    return self._claim_row(db, promoted)
+                    claimed = self._claim_row(db, promoted)
+                    if claimed is not None:
+                        return claimed
+                    continue
                 # Preserve FIFO within each tier. Known ordinary jobs always
                 # run before large books/series, regardless of discovery time.
                 row = db.execute(
@@ -1006,13 +1030,16 @@ class BacklogStore:
                     (*parameters, DEFER_PAGE_COUNT, DEFER_SERIES_BOOK_COUNT),
                 ).fetchone()
                 if row is not None:
-                    return self._claim_row(db, row)
+                    claimed = self._claim_row(db, row)
+                    if claimed is not None:
+                        return claimed
+                    continue
 
                 # Databases created before queue priority metadata was added
                 # are classified from the ZIP central directory before any
                 # deferred job can start. No image is extracted or decoded.
                 unknown = db.execute(
-                    f"""SELECT id,source_path FROM books WHERE {scope}
+                    f"""SELECT id,source_path,root_path FROM books WHERE {scope}
                        AND archive_page_count IS NULL
                        AND {series_size} <= ?
                        ORDER BY queued_at, id LIMIT 1""",
@@ -1024,7 +1051,16 @@ class BacklogStore:
                            ORDER BY queued_at, id LIMIT 1""",
                         parameters,
                     ).fetchone()
-                    return self._claim_row(db, deferred) if deferred is not None else None
+                    if deferred is None:
+                        return None
+                    claimed = self._claim_row(db, deferred)
+                    if claimed is not None:
+                        return claimed
+                    continue
+                # Unknown page counts otherwise open the archive outside the
+                # transaction. Retire the row before any replica filesystem I/O.
+                if self._hold_retired_row(db, unknown):
+                    continue
 
             try:
                 page_count = inspect_cbz_page_count(unknown["source_path"])
@@ -1043,7 +1079,21 @@ class BacklogStore:
                 if updated.rowcount and warning:
                     self._event(db, "queue_priority_warning", warning, book_id=unknown["id"])
 
-    def _claim_row(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    def _hold_retired_row(self, db: sqlite3.Connection, row: sqlite3.Row) -> bool:
+        """Hold an obsolete queued job before consuming an attempt or touching files."""
+        if not _retired_book(row):
+            return False
+        # Both callers selected this queued row under BEGIN IMMEDIATE.
+        db.execute("UPDATE books SET state='held',current_stage=NULL,updated_at=? WHERE id=?",
+                   (utc_now(), row["id"]))
+        self._event(db, "retired_root_hold",
+                    f"Retired Tower replica job held; discover its X: copy instead: {row['source_path']}",
+                    book_id=row["id"])
+        return True
+
+    def _claim_row(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict | None:
+        if self._hold_retired_row(db, row):
+            return None
         now = utc_now()
         db.execute(
             """UPDATE books SET state='processing', attempts=attempts+1, started_at=?,
@@ -1394,14 +1444,14 @@ class BacklogStore:
         """Queue one known book for missing methods or an explicit repeat run."""
         source = os.path.abspath(source_path)
         with self.connect() as db:
-            row = db.execute("SELECT id,state FROM books WHERE source_path=?", (source,)).fetchone()
+            row = db.execute("SELECT id,state,source_path,root_path FROM books WHERE source_path=?", (source,)).fetchone()
         if row is None:
             raise ValueError("Book is not in the library backlog; crawl its root first")
         if row["state"] == "processing":
             raise ValueError("Cannot change a book while it is processing")
-        with self.connect() as db:
-            root_row = db.execute("SELECT root_path FROM books WHERE id=?", (row["id"],)).fetchone()
-        if excluded_library_path(source, root_row["root_path"]):
+        if _retired_book(row):
+            raise ValueError("Retired Tower replica jobs cannot be requeued; crawl X:\\comix instead")
+        if excluded_library_path(source, row["root_path"]):
             raise ValueError("Sync/version-history directories cannot be queued for processing")
         if not os.path.isfile(source):
             raise ValueError(f"Book is no longer available: {source}")
@@ -1419,7 +1469,11 @@ class BacklogStore:
         now = utc_now()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            current = db.execute("SELECT state FROM books WHERE id=?", (row["id"],)).fetchone()
+            current = db.execute("SELECT state,source_path,root_path FROM books WHERE id=?", (row["id"],)).fetchone()
+            if current is None:
+                raise ValueError("Book is no longer in the backlog; refresh the list")
+            if _retired_book(current):
+                raise ValueError("Retired Tower replica jobs cannot be requeued; crawl X:\\comix instead")
             if current["state"] == "processing":
                 raise ValueError("Cannot change a book while it is processing")
             db.execute(
@@ -1513,10 +1567,12 @@ class BacklogStore:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = {r["id"]: r for r in db.execute(
-                f"SELECT id,state,source_path FROM books WHERE id IN ({placeholders})", book_ids
+                f"SELECT id,state,source_path,root_path FROM books WHERE id IN ({placeholders})", book_ids
             )}
             if len(rows) != len(book_ids):
                 raise ValueError("A selected book is no longer in the backlog; refresh the list")
+            if action == "release" and any(_retired_book(row) for row in rows.values()):
+                raise ValueError("Retired Tower replica jobs must stay held; crawl X:\\comix instead")
             expected = "held" if action == "release" else "queued"
             if any(r["state"] != expected for r in rows.values()):
                 raise ValueError(f"This action requires {expected} books; refresh the list. Processing books are locked.")
