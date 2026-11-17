@@ -340,13 +340,13 @@ has begun because that short phase must remain atomic. If an archive is moved
 or deleted manually while its job is active, Camelia also marks it skipped
 instead of failed, so Resume does not repeatedly retry the missing path.
 
-For a bounded check, choose **Run this book only** on one queued entry in the
+For a bounded check, choose **Run this book only** on one queued X:\comix entry in the
 book queue. Disable batch scheduling and wait for any existing worker to finish
 first. This action binds that book ID and runs the ordinary detector, source
 registration, original backup, replacement and catalog handoff. Its saved
 automatic/manual method selection is retained. Failed jobs are not retried,
 held jobs are not released, and another entry is never substituted. The queue
-pauses after that one claim, including a clean detection skip, refusal or
+stays paused throughout and after that one claim, including a clean detection skip, refusal or
 failure; a concurrent requeue of the same ID cannot make it run twice. A skipped
 book does not prove replacement or backup offload. The usual pending-backup and
 catalog reconciliation runs before the selected book, just as with Resume.
