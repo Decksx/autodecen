@@ -1793,6 +1793,7 @@ class SingleBookRunTests(unittest.TestCase):
         manager = LibraryBacklog(self.store, self.complete)
         for target in ('library_backlog.threading.Thread.start','library_backlog.threading.Thread'):
             with self.subTest(target=target):
+                self.store.control_queue('paused')
                 with patch(target, side_effect=RuntimeError('no worker')):
                     with self.assertRaisesRegex(RuntimeError, 'no worker'): manager.run_one_book(self.ids[1])
                 self.assertEqual(self.store.queue_control(), 'paused')
