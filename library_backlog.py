@@ -53,6 +53,10 @@ SCHEDULE_TIMEZONE = ZoneInfo("America/Denver")
 PROCESSING_ISSUES_DIRECTORY = "_processing issues"
 
 
+class RegistrationRefused(ValueError):
+    """One archive cannot be registered safely; the crawl may continue past it."""
+
+
 def _filesystem_path(path: str) -> str:
     """Use extended-length paths for Windows filesystem operations."""
     value = os.fspath(path)
@@ -466,6 +470,7 @@ class BacklogStore:
                     eligible_count INTEGER NOT NULL DEFAULT 0,
                     skipped_count INTEGER NOT NULL DEFAULT 0,
                     parse_error_count INTEGER NOT NULL DEFAULT 0,
+                    refused_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     completed_at TEXT
@@ -554,6 +559,9 @@ class BacklogStore:
                 """
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(books)")}
+            scan_columns = {row["name"] for row in db.execute("PRAGMA table_info(scans)")}
+            if "refused_count" not in scan_columns:
+                db.execute("ALTER TABLE scans ADD COLUMN refused_count INTEGER NOT NULL DEFAULT 0")
             if "eligibility_version" not in columns:
                 db.execute("ALTER TABLE books ADD COLUMN eligibility_version INTEGER NOT NULL DEFAULT 1")
             if "duration_seconds" not in columns:
@@ -768,15 +776,15 @@ class BacklogStore:
         key = os.path.normcase(normalized)
         rows = db.execute("SELECT * FROM books WHERE source_key=? LIMIT 2", (key,)).fetchall()
         if len(rows) > 1:
-            raise ValueError(f"Ambiguous backlog source records; retained for review: {normalized}")
+            raise RegistrationRefused(f"Ambiguous backlog source records; retained for review: {normalized}")
         prior = rows[0] if rows else None
         if prior and prior["source_path"] != normalized:
             try:
                 same = os.path.samefile(prior["source_path"], normalized)
             except OSError as exc:
-                raise ValueError(f"Cannot verify backlog source spelling: {normalized}") from exc
+                raise RegistrationRefused(f"Cannot verify backlog source spelling: {normalized}") from exc
             if not same:
-                raise ValueError(f"Backlog source spellings name different files: {normalized}")
+                raise RegistrationRefused(f"Backlog source spellings name different files: {normalized}")
         return prior
 
     def _reuse_unchanged(self, db, prior, scan_id: int, normalized: str, stat, now: str) -> bool:
@@ -785,6 +793,10 @@ class BacklogStore:
                 and prior["file_size"] == stat.st_size and prior["mtime_ns"] == stat.st_mtime_ns):
             return False
         db.execute("UPDATE books SET last_scan_id=?, updated_at=? WHERE id=?", (scan_id, now, prior["id"]))
+        if prior["source_path"] != normalized:
+            self._event(db, "source_alias_reused",
+                        f"Source alias reused: {normalized}; retained queue path: {prior['source_path']}",
+                        scan_id=scan_id, book_id=prior["id"])
         if prior["last_scan_id"] != scan_id:
             self._increment_scan(db, scan_id, prior["state"], unchanged=True)
             self._event(db, "scan_unchanged", f"Unchanged archive reused: {normalized}", scan_id=scan_id, book_id=prior["id"])
@@ -814,7 +826,7 @@ class BacklogStore:
             if self._reuse_unchanged(db, prior, scan_id, normalized, stat, now):
                 return "unchanged"
             if prior and prior["state"] == "processing":
-                raise ValueError(f"Source changed while processing; retry after the job finishes: {normalized}")
+                raise RegistrationRefused(f"Source changed while processing; retry after the job finishes: {normalized}")
             if prior and prior["state"] == "held" and sequence:
                 state = "held"
             values = (
@@ -878,8 +890,8 @@ class BacklogStore:
         db.execute(
             """UPDATE scans SET total_found=total_found+1, scanned_count=scanned_count+?,
                eligible_count=eligible_count+?, skipped_count=skipped_count+?,
-               parse_error_count=parse_error_count+?, updated_at=? WHERE id=?""",
-            (0 if unchanged else 1, eligible, skipped, int(parse_error), utc_now(), scan_id),
+               parse_error_count=parse_error_count+?, refused_count=refused_count+?, updated_at=? WHERE id=?""",
+            (0 if unchanged else 1, eligible, skipped, int(parse_error), int(state == "refused"), utc_now(), scan_id),
         )
 
     def control_queue(self, status: str) -> None:
@@ -1737,6 +1749,11 @@ class LibraryBacklog:
                                 children.append(entry.path)
                         elif entry.is_file(follow_symlinks=False) and entry.name.casefold().endswith(".cbz"):
                             self.store.record_archive(scan_id, root, entry.path, entry.stat(follow_symlinks=False), inspect_cbz_eligibility)
+                    except RegistrationRefused as exc:
+                        LOGGER.warning("Archive registration refused: %s: %s", entry.path, exc)
+                        with self.store.connect() as db:
+                            self.store._event(db, "scan_refused", f"Archive registration refused: {entry.path}: {exc}", scan_id=scan_id)
+                            self.store._increment_scan(db, scan_id, "refused")
                     except OSError as exc:
                         LOGGER.warning("Could not inspect %s: %s", entry.path, exc)
                         with self.store.connect() as db:
