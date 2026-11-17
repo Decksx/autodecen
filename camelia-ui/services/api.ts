@@ -106,6 +106,7 @@ export interface LibraryScanStatus {
 }
 
 export interface LibraryBacklogStatus {
+    single_book_id?: number | null;
     allowed_roots: string[];
     comic_automation_handoff_configured: boolean;
     source_registration_configured: boolean;
@@ -244,6 +245,14 @@ export async function controlLibraryScan(
 
 export async function controlLibraryQueue(action: 'pause' | 'resume' | 'stop' | 'cancel-current'): Promise<void> {
     await backlogRequest(`/queue/${action}`, { method: 'POST' });
+}
+
+/** Run only this queued identity through the normal pipeline, then pause. */
+export async function runOneLibraryBook(bookId: number): Promise<void> {
+    await backlogRequest('/queue/one', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ book_id: bookId })
+    });
 }
 
 export async function controlLibraryDetectionMode(enabled: boolean): Promise<void> {

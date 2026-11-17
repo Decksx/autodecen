@@ -999,11 +999,13 @@ class BacklogStore:
             self._event(db, event_type, message)
 
     def claim_job(self, root_path: str | None = None,
-                  exclude_root: str | None = None) -> dict | None:
-        parameters = (root_path, root_path, exclude_root, exclude_root)
+                  exclude_root: str | None = None, book_id: int | None = None) -> dict | None:
+        """Claim within the requested scope; a named run never falls back to another ID."""
+        parameters = (root_path, root_path, exclude_root, exclude_root, book_id, book_id)
         scope = """state='queued' AND attempts <= max_retries
                    AND (? IS NULL OR root_path = ? COLLATE NOCASE)
-                   AND (? IS NULL OR root_path <> ? COLLATE NOCASE)"""
+                   AND (? IS NULL OR root_path <> ? COLLATE NOCASE)
+                   AND (? IS NULL OR id = ?)"""
         series_size = """(SELECT COUNT(*) FROM books AS related
                             WHERE related.root_path = books.root_path COLLATE NOCASE
                               AND related.series_path = books.series_path COLLATE NOCASE)"""
@@ -1294,10 +1296,10 @@ class BacklogStore:
                 (now, error, now, book_id),
             )
             db.execute(
-                """UPDATE books SET source_path=?, state='quarantined', current_stage=NULL,
+                """UPDATE books SET source_path=?, source_key=?, state='quarantined', current_stage=NULL,
                    last_error=?, output_path=NULL, file_size=?, mtime_ns=?, completed_at=?,
                    duration_seconds=?, updated_at=? WHERE id=?""",
-                (issue_path, error, issue_stat.st_size, issue_stat.st_mtime_ns, now,
+                (issue_path, os.path.normcase(os.path.abspath(issue_path)), error, issue_stat.st_size, issue_stat.st_mtime_ns, now,
                  elapsed_seconds(row["started_at"], now), now, book_id),
             )
             self._event(
@@ -1709,6 +1711,7 @@ class LibraryBacklog:
         self.cancel_callback = cancel_callback
         self._scan_threads: dict[int, threading.Thread] = {}
         self._queue_thread: threading.Thread | None = None
+        self._single_book_id: int | None = None
         self._thread_lock = threading.Lock()
         self._cancel_lock = threading.Lock()
         self._cancel_book_id: int | None = None
@@ -1819,6 +1822,49 @@ class LibraryBacklog:
             self.store.finish_directory(scan_id, directory, children, error=error)
 
     def resume_queue(self, retry_failed=True) -> int:
+        """Resume normal continuous processing, optionally retrying failed records."""
+        return self._start_queue(retry_failed=retry_failed)
+
+    def run_one_book(self, book_id: int) -> None:
+        """Run one already-queued identity through the ordinary pipeline, then pause.
+
+        This never releases held records or retries failed work. The ID filter
+        and worker claim budget both remain in force if the book is skipped,
+        disappears, or is held after the request but before the worker claims it.
+        """
+        if type(book_id) is not int or book_id <= 0:
+            raise ValueError("Choose one positive integer book_id")
+        self._start_queue(retry_failed=False, book_id=book_id)
+
+    def single_book_id(self) -> int | None:
+        """Expose the bounded worker while the normal queue remains paused."""
+        with self._thread_lock:
+            return self._single_book_id
+
+    def _start_queue(self, retry_failed: bool, book_id: int | None = None) -> int:
+        # Serialize launch decisions, including the paused-thread shutdown gap.
+        with self._thread_lock:
+            return self._start_queue_locked(retry_failed, book_id)
+
+    def _start_queue_locked(self, retry_failed: bool, book_id: int | None) -> int:
+        if book_id is not None:
+            if (self.store.queue_control() == "running"
+                    or (self._queue_thread and self._queue_thread.is_alive())
+                    or self.store.processing_book() is not None):
+                raise ValueError("Pause the queue and wait for its current worker to finish")
+            if self.store.schedule_enabled():
+                raise ValueError("Disable the batch schedule before running one book")
+            with self.store.connect() as db:
+                row = db.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+                if row is None or row["state"] != "queued" or row["attempts"] > row["max_retries"]:
+                    raise ValueError("The selected book is not queued and claimable")
+                if _retired_book(row):
+                    raise ValueError("Retired Tower replica jobs cannot be processed")
+                if (os.path.normcase(os.path.abspath(row["root_path"])) != os.path.normcase(os.path.abspath(SCHEDULE_ROOT))
+                        or excluded_library_path(row["source_path"], SCHEDULE_ROOT)):
+                    raise ValueError(f"Choose a queued book inside the active library {SCHEDULE_ROOT}")
+                if db.execute("SELECT COUNT(*) FROM books WHERE source_key=?", (row["source_key"],)).fetchone()[0] != 1:
+                    raise ValueError("The selected book has an ambiguous source identity")
         if self.store.known_types_only() and self.detector is None:
             raise ValueError("Known-types-only queue mode requires a censorship detector")
         if self.require_backup_offload and self.backup_callback is None:
@@ -1841,11 +1887,21 @@ class LibraryBacklog:
         retried = self.store.retry_failed() if retry_failed else 0
         if self.store.schedule_enabled():
             self.store.control_scheduled_autostart(True)
-        self.store.control_queue("running")
-        with self._thread_lock:
-            if not self._queue_thread or not self._queue_thread.is_alive():
-                self._queue_thread = threading.Thread(target=self._process_queue, daemon=True, name="library-backlog")
+        self.store.control_queue("paused" if book_id is not None else "running")
+        if book_id is not None:
+            self.store.control_scheduled_autostart(False)
+        if not self._queue_thread or not self._queue_thread.is_alive():
+            try:
+                self._single_book_id = book_id
+                self._queue_thread = threading.Thread(
+                    target=self._process_queue, kwargs={"book_id": book_id} if book_id is not None else {},
+                    daemon=True, name="library-backlog")
                 self._queue_thread.start()
+            except Exception:
+                self._queue_thread = None
+                self._single_book_id = None
+                self.pause_queue()
+                raise
         return retried
 
     @staticmethod
@@ -1997,7 +2053,24 @@ class LibraryBacklog:
         self.store.control_scheduled_autostart(False)
         self.store.control_queue("stopped")
 
-    def _process_queue(self) -> None:
+    def _process_queue(self, book_id: int | None = None) -> None:
+        """Keep the single-book budget across every ordinary pipeline outcome."""
+        try:
+            self._process_queue_body(book_id)
+        except Exception as exc:
+            if book_id is None:
+                raise
+            LOGGER.exception("Single-book worker failed for %s", book_id)
+            self.store.record_schedule_event("single_book_error", f"Book {book_id}: {type(exc).__name__}: {exc}")
+        finally:
+            if book_id is not None:
+                try:
+                    self.pause_queue()
+                finally:
+                    with self._thread_lock:
+                        self._single_book_id = None
+
+    def _process_queue_body(self, selected_book_id: int | None = None) -> None:
         if self.backup_callback is not None:
             try:
                 self.backup_callback(None, None)
@@ -2013,7 +2086,16 @@ class LibraryBacklog:
                 self.pause_queue()
                 return
         waiting_for_window = False
-        while self.store.queue_control() == "running":
+        claimed_once = False
+        while True:
+            control = self.store.queue_control()
+            if ((selected_book_id is None and control != "running")
+                    or (selected_book_id is not None and control == "stopped")):
+                break
+            # Count a claim, rather than a successful replacement: clean skips
+            # and handled errors must never advance a one-book run to a sibling.
+            if selected_book_id is not None and claimed_once:
+                return
             scheduled = self.store.schedule_enabled()
             if scheduled:
                 window = processing_window_status()
@@ -2034,13 +2116,17 @@ class LibraryBacklog:
             job = self.store.claim_job(
                 root_path=SCHEDULE_ROOT if scheduled else None,
                 exclude_root=SCHEDULE_ROOT if self.sync_callback is None else None,
+                **({"book_id": selected_book_id} if selected_book_id is not None else {}),
             )
             if job is None:
+                if selected_book_id is not None:
+                    return
                 # Stay alive while a crawl is still discovering work. This
                 # also lets a running queue consume books added by a later
                 # scan without another manual resume click.
                 time.sleep(0.5)
                 continue
+            claimed_once = True
             book_id = job["id"]
             book_started = time.perf_counter()
             sequence = json.loads(job["selected_sequence"])
@@ -2191,7 +2277,8 @@ class LibraryBacklog:
         # A quick pause/resume can race the old worker's final loop check.
         # Replace it only if the queue was resumed while this thread exited.
         with self._thread_lock:
-            if self._queue_thread is threading.current_thread() and self.store.queue_control() == "running":
+            if (selected_book_id is None and self._queue_thread is threading.current_thread()
+                    and self.store.queue_control() == "running"):
                 self._queue_thread = threading.Thread(
                     target=self._process_queue, daemon=True, name="library-backlog"
                 )

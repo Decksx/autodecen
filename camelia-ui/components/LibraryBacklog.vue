@@ -169,7 +169,7 @@
                 </p>
             </div>
 
-            <LibraryQueue :roots="roots" @changed="refresh" @inspect="inspectQueueBook" />
+            <LibraryQueue :roots="roots" :can-run-one="canRunOne" @changed="refresh" @inspect="inspectQueueBook" />
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-3">
                 <h3 class="text-sm text-foam">Queue one previously crawled book</h3>
@@ -251,6 +251,15 @@ let selectionInitialized = false;
 
 const roots = computed(() => status.value?.allowed_roots?.length ? status.value.allowed_roots : fallbackRoots);
 const scan = computed(() => status.value?.scan ?? null);
+// A named run has the same integration gates as normal processing, and
+// cannot compete with an active worker or an automatic batch schedule.
+const canRunOne = computed(() => {
+    const current = status.value;
+    return !!current && !busy.value && current.queue_status !== 'running' && current.single_book_id == null
+        && current.counts.processing === 0 && !current.batch_schedule.enabled
+        && current.backup_offload_configured && current.comic_automation_handoff_configured
+        && current.source_registration_configured;
+});
 const visibleBooks = computed<LibraryBookProgress[]>(() => {
     const recent = status.value?.recent_books ?? [];
     return lookedUpBook.value && !recent.some((book) => book.id === lookedUpBook.value!.id)

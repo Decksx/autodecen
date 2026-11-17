@@ -93,6 +93,8 @@
                             <td class="p-3 min-w-44">
                                 <div class="flex flex-wrap gap-2">
                                     <button class="queue-button" :disabled="busy" @click="emit('inspect', book.source_path)">View progress</button>
+                                    <button v-if="book.state === 'queued'" class="queue-button"
+                                        :disabled="busy || !canRunOne" @click="runOne(book)">Run this book only</button>
                                     <button v-if="['queued', 'held', 'failed', 'skipped'].includes(book.state)" class="queue-button" :disabled="busy" @click="edit(book)">
                                         {{ book.state === 'failed' || book.state === 'skipped' ? 'Retry / edit' : 'Edit methods' }}
                                     </button>
@@ -136,10 +138,10 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import { editLibraryQueueBooks, getLibraryQueueBooks, requeueLibraryBook, pruneMissingLibraryBooks } from '@/services/api';
+import { editLibraryQueueBooks, getLibraryQueueBooks, requeueLibraryBook, pruneMissingLibraryBooks, runOneLibraryBook } from '@/services/api';
 import type { LibraryQueueBook, LibraryQueueEdit, LibraryQueuePage, ProcessingType, LibraryPrunePreview } from '@/services/api';
 
-defineProps<{ roots: string[] }>();
+defineProps<{ roots: string[]; canRunOne?: boolean }>();
 const emit = defineEmits<{ changed: []; inspect: [path: string] }>();
 const expanded = ref(true);
 const page = ref<LibraryQueuePage | null>(null);
@@ -224,6 +226,12 @@ function act(action: LibraryQueueEdit): void {
     void run(async () => {
         await editLibraryQueueBooks(ids, action);
         notice.value = `${ids.length} book${ids.length === 1 ? '' : 's'} updated.`;
+    });
+}
+function runOne(book: LibraryQueueBook): void {
+    void run(async () => {
+        await runOneLibraryBook(book.id);
+        notice.value = 'Running only this book. The queue will pause afterward, including if it is skipped.';
     });
 }
 async function previewPrune(): Promise<void> {
