@@ -240,10 +240,20 @@ queued books. The crawler records page counts from ZIP directory metadata withou
 extracting or decoding images. Existing database rows are classified lazily before
 the queue claims any deferred work, so upgrading does not require rebuilding the
 backlog database.
-The crawl excludes sync and system history directories (`.stversions`,
-`.stfolder`, `@eaDir`, `$RECYCLE.BIN`, and `System Volume Information`),
-including directories retained by an older checkpoint. A previously queued
-history file is skipped before model work.
+The crawl excludes sync and system history directories, ComicAutomation's
+canonical journals/quarantine and writer-control names, `ai-decensor-originals`
+and `ai_decensor_originals`, `_processing issues`, and every directory whose
+name starts with `_quarantine_`. Component matching is case-insensitive at any
+depth; ordinary names such as `Quarantine Story` are unaffected. This applies
+to new crawls and directories retained by an older checkpoint. A previously
+queued history file is skipped before model work, and manual requeue refuses
+these paths. The exclusions preserve historical copies; they never delete files.
+
+Discovering a new library root reads ZIP metadata and `ComicInfo.xml`; it does
+not run censorship detection or the model pipeline while processing is paused.
+Old held records remain separate history when the same collection is crawled
+through a new root. A new path does not inherit their detection caches or stage
+evidence; archive method tags determine which passes remain necessary.
 
 Eligible books run sequentially through `black_bars`, `transparent_black`,
 `white_bars`, and detector-gated Aletheia-Lens `mosaic` restoration using the

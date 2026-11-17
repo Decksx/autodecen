@@ -29,7 +29,12 @@ LOGGER = logging.getLogger(__name__)
 PROCESSED_MARKERS = ("uncensored", "decensored")
 DEFAULT_ROOTS = (r"X:\comix", r"Z:\comics\Comix")
 EXCLUDED_DIRECTORY_NAMES = frozenset({
-    ".stversions", ".stfolder", "@eadir", "$recycle.bin", "system volume information",
+    ".stversions", ".stversion", ".stfolder", ".stignore", "@eadir",
+    "$recycle.bin", "system volume information",
+    ".cbz-canonical-naming", ".cbz-canonical-naming.lock",
+    ".cbz-canonical-naming.owner.json", ".cbz-canonical-quarantine",
+    ".cbz-library-writers.lock", ".cbz-library-writers.owner.json",
+    "ai-decensor-originals", "ai_decensor_originals",
     "_processing issues",
 })
 DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars", "mosaic")
@@ -102,7 +107,7 @@ def normalize_detection_result(result: dict) -> dict:
 
 
 def excluded_library_path(path: str, root: str, *, directory: bool = False) -> bool:
-    """Match ComicAutomation's sync/history exclusions and refuse paths outside root."""
+    """Exclude preserved copies/history at any depth and refuse paths outside root."""
     try:
         relative = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
     except ValueError:  # Different Windows drives.
@@ -113,7 +118,10 @@ def excluded_library_path(path: str, root: str, *, directory: bool = False) -> b
     if not parts or parts[0] == os.pardir:
         return True
     checked = parts if directory else parts[:-1]
-    return any(part.casefold() in EXCLUDED_DIRECTORY_NAMES for part in checked)
+    # A fresh root crawl must not rediscover preserved originals or superseded
+    # versions as eligible work. The same rule protects already-queued copies.
+    return any(part.casefold() in EXCLUDED_DIRECTORY_NAMES
+               or part.casefold().startswith("_quarantine_") for part in checked)
 
 
 def processing_window_status(now: datetime | None = None) -> dict:
