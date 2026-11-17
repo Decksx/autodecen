@@ -177,8 +177,11 @@ reloads, so code edits cannot interrupt a running library job. Restart the API
 after updating code. For development only, set `CAMELIA_DEBUG=true` to opt into
 the debugger and automatic reloads.
 
-The **Library Decensor Backlog** section crawls either `X:\comix` or
-`Z:\comics\Comix` recursively. It reads the filename and
+The **Library Decensor Backlog** section crawls `X:\comix` recursively.
+Tower's `Z:\comics\Comix` is the receive-only replica after the X: cutover:
+new crawls and resuming an old crawl there are refused. Existing held Z: rows
+and their history remain in the database; this does not migrate or release them.
+The crawler reads the filename and
 `ComicInfo.xml` directly from each CBZ. Generic `uncensored`/`decensored`
 markers without method tags are skipped, while books with method tags are
 queued only for the remaining passes. Image pages are not extracted during
