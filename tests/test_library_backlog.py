@@ -39,6 +39,49 @@ def make_cbz(path: Path, comicinfo: str | None = None, *, page_count: int = 1) -
 
 
 class LibraryBacklogTests(unittest.TestCase):
+    def test_default_crawl_roots_allow_x_and_refuse_tower_even_when_available(self):
+        with patch("library_backlog.os.path.isdir", return_value=True) as isdir:
+            self.assertEqual(LibraryBacklog.validate_root(r"X:\Comix"), r"X:\Comix")
+            isdir.reset_mock()
+            with self.assertRaisesRegex(ValueError, "Library root must be one of"):
+                LibraryBacklog.validate_root(r"Z:\comics\Comix")
+            isdir.assert_not_called()
+
+    def test_api_refuses_new_and_resumed_tower_crawls_without_removing_held_history(self):
+        import api
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            # Repository setup is DB-only. This is retained pre-cutover history;
+            # the API/manager must refuse to run it without touching a library.
+            root = r"Z:\comics\Comix"
+            scan = store.start_scan(root)
+            store.set_scan_status(scan, "paused", "Historical fixture scan")
+            with store.connect() as db:
+                db.execute("""INSERT INTO books(source_path,root_path,file_size,mtime_ns,state,
+                           selected_sequence,discovered_at,updated_at)
+                           VALUES(?,?,1,1,'held','[]','fixture','fixture')""",
+                           (root + r"\Series\Book.cbz", root))
+            manager = LibraryBacklog(store, lambda *args: None)
+            # Also keeps the base/mutant witness safe: a bypass cannot launch a
+            # thread against the real Tower root during this API test.
+            with patch.object(api, "library_backlog", manager), \
+                    patch("library_backlog.os.path.isdir", return_value=True), \
+                    patch("library_backlog.threading.Thread") as worker:
+                for endpoint, body in (("/api/library-backlog/scan/start", {"root": root}),
+                                       (f"/api/library-backlog/scan/{scan}/resume", {})):
+                    with self.subTest(endpoint=endpoint):
+                        response = api.app.test_client().post(endpoint, json=body,
+                                                             headers={"Origin": "http://localhost:3000"})
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn("Library root must be one of", response.get_json()["error"])
+                worker.assert_not_called()
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["allowed_roots"], [r"X:\comix"])
+            self.assertEqual(snapshot["counts"]["held"], 1)
+            self.assertEqual(store.scan_status(scan), "paused")
+            self.assertEqual(store.queue_control(), "paused")
+
     def test_history_and_quarantine_components_are_excluded_at_any_depth(self):
         # Keep this independent list explicit: these trees contain preserved
         # copies, not new work, even when their archives have no processed tag.
