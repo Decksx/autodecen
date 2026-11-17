@@ -1787,6 +1787,11 @@ def control_library_queue(action):
         retried = 0
         if action == 'resume':
             retried = library_backlog.resume_queue(retry_failed=True)
+        elif action == 'one':
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict):
+                raise ValueError('Choose one book_id in a JSON object')
+            library_backlog.run_one_book(data.get('book_id'))
         elif action == 'pause':
             library_backlog.pause_queue()
         elif action == 'stop':
