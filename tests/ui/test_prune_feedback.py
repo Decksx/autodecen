@@ -42,6 +42,12 @@ class PruneFeedbackTests(unittest.TestCase):
 
     def check_page(self, port):
         held, calls, page_errors = [], [], []
+        one_calls, one_held = [], []
+        readiness = dict(backup_offload_configured=False,
+                         comic_automation_handoff_configured=False, source_registration_configured=False)
+        book = dict(id=42,source_path='C:\\fixture\\Pilot.cbz',metadata_title='Pilot',state='queued',
+                    archive_page_count=5,last_error=None,queue_priority=0,deferred=False,
+                    current_stage=None,auto_detect=1,selected_sequence=['black_bars'])
         counts = dict.fromkeys(['discovered','eligible','queued','held','processing','completed','failed','quarantined','skipped'], 0)
         preview = dict(missing_count=2, removed_count=0, by_state={'queued':1,'skipped':1},
             kept_count=3, unverified_count=0, unavailable_roots=[], snapshot_digest='a'*64,
@@ -57,13 +63,17 @@ class PruneFeedbackTests(unittest.TestCase):
             elif request.url.endswith('/books/prune-missing'):
                 calls.append(request.post_data_json)
                 held.append(route)  # keep fetch pending until the test releases it
+            elif request.url.endswith('/queue/one'):
+                one_calls.append(request.post_data_json)
+                one_held.append(route)
             elif '/books?' in request.url:
-                respond(route, dict(items=[],total=0,counts=counts,limit=50,offset=0))
+                respond(route, dict(items=[book],total=1,counts=counts,limit=50,offset=0))
             else:
-                respond(route, dict(allowed_roots=['C:\\fixture'],scan=None,queue_status='paused',known_types_only=False,
+                status = dict(allowed_roots=['C:\\fixture'],scan=None,queue_status='paused',known_types_only=False,
                     counts=counts,current_file=None,current_stage=None,recent_books=[],events=[],
-                    batch_schedule={'enabled':False,'auto_resume':False,'in_window':False},
-                    backup_offload_configured=False,comic_automation_handoff_configured=False,source_registration_configured=False))
+                    batch_schedule={'enabled':False,'auto_resume':False,'in_window':False})
+                status.update(readiness)
+                respond(route, status)
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel=os.environ.get('CAMELIA_TEST_BROWSER') or None, headless=True)
             try:
@@ -112,6 +122,34 @@ class PruneFeedbackTests(unittest.TestCase):
                 page.wait_for_timeout(5500)
                 expect(alert).to_be_visible()
                 expect(button).to_be_enabled()
+
+                # The named action must carry the selected ID, with normal
+                # integration/worker/schedule gates and no queue-wide Resume.
+                one = page.get_by_role('button',name='Run this book only',exact=True)
+                expect(one).to_be_disabled()
+                ready = dict(backup_offload_configured=True,
+                             comic_automation_handoff_configured=True, source_registration_configured=True)
+                gates = [{key:False} for key in ready]
+                gates += [dict(queue_status='running'), dict(counts=dict(counts,processing=1)),
+                          dict(batch_schedule={'enabled':True,'auto_resume':False,'in_window':False})]
+                for gate in gates:
+                    readiness.clear(); readiness.update(ready); readiness.update(gate)
+                    page.reload(wait_until='domcontentloaded')
+                    expect(one).to_be_disabled()
+                readiness.clear(); readiness.update(ready)
+                page.reload(wait_until='domcontentloaded')
+                expect(one).to_be_enabled()
+                one.click()
+                expect(one).to_be_disabled()
+                self.assertEqual(one_calls, [{'book_id':42}])
+                respond(one_held.pop(), {'error':'Wait for the current worker'}, status=400)
+                expect(page.get_by_role('alert').filter(has_text='Wait for the current worker')).to_be_visible()
+                expect(one).to_be_enabled()
+                one.click()
+                expect(one).to_be_disabled()
+                respond(one_held.pop(), {'success':True,'retried':0})
+                expect(page.get_by_role('status').filter(has_text='Running only this book')).to_be_visible()
+                self.assertEqual(one_calls, [{'book_id':42},{'book_id':42}])
                 self.assertEqual(page_errors, [])
             finally:
                 browser.close()
