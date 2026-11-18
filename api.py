@@ -28,6 +28,7 @@ from library_backlog import (
     BacklogStore,
     DEFAULT_SEQUENCE,
     LibraryBacklog,
+    SourcePreparationRefused,
     add_uncensored_tag,
     assert_overwrite_allowed,
     format_elapsed_duration,
@@ -1432,6 +1433,20 @@ def _configured_source_registration():
         run = subprocess.run(command, cwd=suite_root, capture_output=True,
                              text=True, timeout=3600, check=False)
         if run.returncode:
+            if run.returncode == 3:
+                try:
+                    refusal = json.loads(run.stdout)
+                except (ValueError, TypeError):
+                    refusal = None
+                if (isinstance(refusal, dict)
+                        and refusal.get("schema") == "camelia-source-refusal-v1"
+                        and refusal.get("code") == "non_current_location"
+                        and isinstance(refusal.get("path"), str)
+                        and os.path.normcase(os.path.abspath(refusal["path"]))
+                        == os.path.normcase(os.path.abspath(job["source_path"]))):
+                    raise SourcePreparationRefused(
+                        f"Catalog marks this source non-current: {job['source_path']}"
+                    )
             raise RuntimeError((run.stderr or run.stdout or "Source registration failed").strip()[:1200])
         preparation = json.loads(run.stdout)["preparation"]
         app.logger.info("ComicAutomation source %s: archive %s, %s",
