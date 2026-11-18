@@ -385,7 +385,18 @@ and page-hash jobs in ComicAutomation. If it fails, Camelia pauses before
 claiming another book; the completed event remains for an idempotent retry.
 Before model work on each X: book, a registration preflight establishes an
 untracked source's ComicAutomation identity and original hash/revision. A
-changed, excluded, or ambiguous source is refused before using the GPU.
+changed, excluded, or ambiguous source is refused before model-driven replacement.
+One known catalog conflict is book-local: when the source is recorded as
+non-current, a compatible suite CLI returns exit 3 with a
+`camelia-source-refusal-v1` JSON report. Camelia requires the exact known code
+and matching source path, leaves that book failed and unchanged, and continues
+with other queued books. The failed book is not retried in that running queue.
+Repair its catalog identity before explicitly retrying it; normal Resume still
+offers its existing failed-job retry. A bounded one-book run still stops after
+this refusal without claiming a sibling. Old suite versions, unknown/malformed
+responses, unavailable roots/databases, backup failures and completion-handoff
+errors continue to pause the queue. Deploy the suite response before this
+consumer, and restart Camelia to load the consumer change.
 It never auto-applies ComicAutomation migrations. See that project's
 `docs/camelia_decensor.md` for the read-only preview command and readiness
 checks. Its watcher monitors an incoming folder, not the X: library.

@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from library_backlog import (
     BacklogStore,
     LibraryBacklog,
+    SourcePreparationRefused,
     add_uncensored_tag,
     assert_overwrite_allowed,
     excluded_library_path,
@@ -1079,6 +1080,50 @@ class LibraryBacklogTests(unittest.TestCase):
             self.assertEqual(store.snapshot()["counts"]["failed"], 1)
             manager._queue_thread.join(timeout=2)
 
+    def test_only_known_book_local_registration_refusal_continues_to_next_book(self):
+        for refusal in (SourcePreparationRefused('non-current'), RuntimeError('database unavailable')):
+            with self.subTest(refusal=type(refusal).__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'comix'
+                paths = [root / 'Series' / name for name in ('a.cbz', 'b.cbz')]
+                store = BacklogStore(str(Path(directory) / 'backlog.sqlite3'))
+                scan = store.start_scan(str(root))
+                for path in paths:
+                    make_cbz(path)
+                    store.record_archive(scan, str(root), str(path), path.stat(), inspect_cbz_eligibility)
+                original = paths[0].read_bytes()
+                calls = []
+                def prepare(job):
+                    calls.append(('register', job['source_path']))
+                    if job['source_path'] == str(paths[0]):
+                        raise refusal
+                def processor(path, sequence, job):
+                    calls.append(('process', path))
+                    add_uncensored_tag(path, sequence)
+                    return {'path': path}
+                manager = LibraryBacklog(store, processor, sync_callback=lambda:None,
+                                         prepare_callback=prepare, require_source_registration=True)
+                try:
+                    with patch('library_backlog.SCHEDULE_ROOT', str(root)):
+                        manager.resume_queue(retry_failed=False)
+                        deadline = time.time() + 4
+                        while time.time() < deadline:
+                            second = store.book_progress(str(paths[1]))['state']
+                            if second == 'completed' or store.queue_control() == 'paused':
+                                break
+                            time.sleep(0.02)
+                    self.assertEqual(store.book_progress(str(paths[0]))['state'], 'failed')
+                    self.assertEqual(store.book_progress(str(paths[0]))['attempts'], 1)
+                    self.assertEqual(paths[0].read_bytes(), original)
+                    local = isinstance(refusal, SourcePreparationRefused)
+                    self.assertEqual(second, 'completed' if local else 'queued')
+                    self.assertEqual(store.queue_control(), 'running' if local else 'paused')
+                    self.assertEqual(calls, [('register',str(paths[0]))] +
+                        ([('register',str(paths[1])),('process',str(paths[1]))] if local else []))
+                finally:
+                    manager.pause_queue()
+                    manager._queue_thread.join(timeout=2)
+
+
     def test_x_source_registration_runs_before_model_and_history_job_is_skipped(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "comix"
@@ -1735,6 +1780,13 @@ class SingleBookRunTests(unittest.TestCase):
                     'pages_by_method':{m:[] for m in ('black_bars','transparent_black','white_bars','mosaic')}}
         rows = self.run_pilot(lambda *_: self.fail('clean book reached model'), detector=detector)
         self.assertEqual(rows[self.ids[1]]['state'], 'skipped')
+
+    def test_book_local_registration_refusal_does_not_expand_one_book_budget(self):
+        def prepare(job):
+            raise SourcePreparationRefused('non-current')
+        rows = self.run_pilot(lambda *_: self.fail('refused source reached model'), prepare_callback=prepare)
+        self.assertEqual(rows[self.ids[1]]['state'], 'failed')
+        self.assertEqual(rows[self.ids[1]]['attempts'], 1)
 
     def test_failure_outcomes_and_early_returns_always_pause(self):
         # Every case has another higher-priority book waiting. A failed pilot
