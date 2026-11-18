@@ -136,9 +136,12 @@ class PruneFeedbackTests(unittest.TestCase):
                     readiness.clear(); readiness.update(ready); readiness.update(gate)
                     page.reload(wait_until='domcontentloaded')
                     expect(one).to_be_disabled()
+                    if gate.get('single_book_id'):
+                        expect(page.get_by_role('button',name='Resume queue',exact=True)).to_be_disabled()
                 readiness.clear(); readiness.update(ready)
                 page.reload(wait_until='domcontentloaded')
                 expect(one).to_be_enabled()
+                expect(page.get_by_role('button',name='Resume queue',exact=True)).to_be_enabled()
                 one.click()
                 expect(one).to_be_disabled()
                 self.assertEqual(one_calls, [{'book_id':42}])
