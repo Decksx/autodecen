@@ -1777,7 +1777,9 @@ class SingleBookRunTests(unittest.TestCase):
             calls.append('handoff')
             if len(calls) == 2:
                 self.store.requeue_book(str(self.paths[1]), ['black_bars'], reprocess=True, automatic=False)
-                self.manager.resume_queue(retry_failed=False)
+                # An old control writer can still set the durable value; the
+                # claim budget is independent of the public Resume refusal.
+                self.store.control_queue('running')
         rows = self.run_pilot(self.complete, sync_callback=handoff)
         self.assertEqual(len(calls), 2)
         self.assertEqual(rows[self.ids[1]]['state'], 'queued')
@@ -1848,7 +1850,8 @@ class SingleBookRunTests(unittest.TestCase):
         try:
             self.assertTrue(entered.wait(2))
             with self.assertRaisesRegex(ValueError,'Pause'): self.manager.run_one_book(self.ids[0])
-            self.manager.resume_queue(retry_failed=False)
+            with self.assertRaisesRegex(ValueError, 'single-book'):
+                self.manager.resume_queue(retry_failed=False)
         finally:
             release.set()
             self.manager._queue_thread.join(2)
@@ -1915,6 +1918,31 @@ class SingleBookRunTests(unittest.TestCase):
             self.assertEqual(client.post('/api/library-backlog/queue/one', json={'book_id':self.ids[1]}).status_code, 400)
             response = client.post('/api/library-backlog/queue/one', json={'book_id':self.ids[1]},headers={'Origin':'https://remote.example'})
             self.assertEqual(response.status_code, 403)
+
+    def test_api_resume_refuses_a_bounded_run_before_retrying_failed_jobs(self):
+        import api
+        entered, release = threading.Event(), threading.Event()
+        def processor(*args):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return self.complete(*args)
+        self.manager = self.manager_for(processor)
+        self.manager.run_one_book(self.ids[1])
+        try:
+            self.assertTrue(entered.wait(2))
+            client = api.app.test_client()
+            client.environ_base['HTTP_ORIGIN'] = 'http://localhost:3000'
+            with patch.object(api, 'library_backlog', self.manager), \
+                    patch.object(self.store, 'retry_failed', side_effect=AssertionError('failed jobs retried')):
+                response = client.post('/api/library-backlog/queue/resume')
+            self.assertEqual(response.status_code, 400)
+            self.assertIn('single-book', response.json['error'])
+            self.assertEqual(self.store.queue_control(), 'paused')
+            self.assertEqual(self.rows()[self.ids[3]]['state'], 'failed')
+        finally:
+            release.set()
+            self.manager._queue_thread.join(2)
+        self.assertEqual(self.rows()[self.ids[0]]['attempts'], 0)
 
 
 class ClaimQueryPlanTests(unittest.TestCase):

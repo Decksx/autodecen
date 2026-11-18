@@ -81,6 +81,9 @@ class PruneFeedbackTests(unittest.TestCase):
                 page.on('pageerror', lambda error: page_errors.append(str(error)))
                 page.route('**/api/**', api)
                 page.goto(f'http://127.0.0.1:{port}', wait_until='domcontentloaded')
+                # A server-rendered button can be clicked before Vue attaches
+                # its handler. The fixture row proves client hydration/load.
+                expect(page.get_by_text('Pilot',exact=True)).to_be_visible()
                 button = page.get_by_role('button', name='Prune missing files', exact=True)
                 button.click()
                 expect(page.get_by_role('button', name='Checking missing files…')).to_be_disabled()
@@ -136,9 +139,12 @@ class PruneFeedbackTests(unittest.TestCase):
                     readiness.clear(); readiness.update(ready); readiness.update(gate)
                     page.reload(wait_until='domcontentloaded')
                     expect(one).to_be_disabled()
+                    if gate.get('single_book_id'):
+                        expect(page.get_by_role('button',name='Resume queue',exact=True)).to_be_disabled()
                 readiness.clear(); readiness.update(ready)
                 page.reload(wait_until='domcontentloaded')
                 expect(one).to_be_enabled()
+                expect(page.get_by_role('button',name='Resume queue',exact=True)).to_be_enabled()
                 one.click()
                 expect(one).to_be_disabled()
                 self.assertEqual(one_calls, [{'book_id':42}])

@@ -352,6 +352,8 @@ book does not prove replacement or backup offload. The usual pending-backup and
 catalog reconciliation runs before the selected book, just as with Resume.
 The local API equivalent is `POST /api/library-backlog/queue/one` with
 `{"book_id": 123}`. This requires the same processing integrations as Resume.
+Resume is disabled in the UI and refused by the API until the single-book run
+finishes, so it cannot unpause the queue or retry unrelated failed records.
 
 When censorship detection or model processing fails for one book, Camelia logs
 the complete error, moves the CBZ to a `_processing issues` folder beside the

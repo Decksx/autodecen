@@ -48,7 +48,7 @@
             </div>
 
             <div class="flex flex-wrap gap-2">
-                <button class="rounded-md px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 bg-iris text-base" :disabled="busy || !status?.backup_offload_configured || (selectedRoot.toLowerCase() === 'x:\\comix' && (!status?.comic_automation_handoff_configured || !status?.source_registration_configured)) || status?.queue_status === 'running'" @click="queueAction('resume')">
+                <button class="rounded-md px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 bg-iris text-base" :disabled="busy || status?.single_book_id != null || !status?.backup_offload_configured || (selectedRoot.toLowerCase() === 'x:\\comix' && (!status?.comic_automation_handoff_configured || !status?.source_registration_configured)) || status?.queue_status === 'running'" @click="queueAction('resume')">
                     Resume queue
                 </button>
                 <button class="rounded-md px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-40 bg-gold text-base" :disabled="busy || status?.queue_status !== 'running'" @click="queueAction('pause')">

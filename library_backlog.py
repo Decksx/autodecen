@@ -1847,6 +1847,10 @@ class LibraryBacklog:
             return self._start_queue_locked(retry_failed, book_id)
 
     def _start_queue_locked(self, retry_failed: bool, book_id: int | None) -> int:
+        # A normal Resume must not temporarily unpause a bounded run or retry
+        # unrelated failures while its book is still in preflight/processing.
+        if book_id is None and self._single_book_id is not None:
+            raise ValueError("Wait for the single-book run to finish before resuming the queue")
         if book_id is not None:
             if (self.store.queue_control() == "running"
                     or (self._queue_thread and self._queue_thread.is_alive())
