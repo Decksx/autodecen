@@ -81,6 +81,9 @@ class PruneFeedbackTests(unittest.TestCase):
                 page.on('pageerror', lambda error: page_errors.append(str(error)))
                 page.route('**/api/**', api)
                 page.goto(f'http://127.0.0.1:{port}', wait_until='domcontentloaded')
+                # A server-rendered button can be clicked before Vue attaches
+                # its handler. The fixture row proves client hydration/load.
+                expect(page.get_by_text('Pilot',exact=True)).to_be_visible()
                 button = page.get_by_role('button', name='Prune missing files', exact=True)
                 button.click()
                 expect(page.get_by_role('button', name='Checking missing files…')).to_be_disabled()
