@@ -58,6 +58,10 @@ class RegistrationRefused(ValueError):
     """One archive cannot be registered safely; the crawl may continue past it."""
 
 
+class SourcePreparationRefused(RuntimeError):
+    """A known book-local catalog refusal before any archive replacement."""
+
+
 def retired_replica_path(path: str) -> bool:
     """Recognize the retired mapped/canonical Tower comics trees without I/O.
 
@@ -2218,6 +2222,9 @@ class LibraryBacklog:
             if self.prepare_callback is not None and job["root_path"].casefold() == SCHEDULE_ROOT.casefold():
                 try:
                     self.prepare_callback(job)
+                except SourcePreparationRefused as exc:
+                    self.store.fail_job(book_id, f"ComicAutomation source registration refused: {exc}")
+                    continue
                 except Exception as exc:
                     self.store.fail_job(book_id, f"ComicAutomation source registration failed: {exc}")
                     self.pause_queue()
