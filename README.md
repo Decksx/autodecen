@@ -195,10 +195,13 @@ including case/slash/extended-length spellings. This retirement list covers the
 known cutover paths, not every possible SMB alias or a remapped drive; additional
 aliases need policy review. No archive is moved or deleted by these checks.
 The crawler reads the filename and
-`ComicInfo.xml` directly from each CBZ. Generic `uncensored`/`decensored`
-markers without method tags are skipped, while books with method tags are
-queued only for the remaining passes. Image pages are not extracted during
-discovery.
+`ComicInfo.xml` directly from each CBZ. Any book already marked
+`uncensored`/`decensored` is skipped by the crawl, even when its Camelia method
+tags show some passes did not run (operator policy, hive #6257). A book with
+method tags but no marker is still queued only for its remaining passes.
+Manual requeue and standalone processing keep the per-method behaviour, so an
+operator can still choose the missing passes for a marked book. Image pages are
+not extracted during discovery.
 
 Scan checkpoints, archive fingerprints, queue transitions, retry/error data,
 stage events, and counts are stored in
