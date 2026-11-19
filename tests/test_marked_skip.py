@@ -103,14 +103,90 @@ class MarkedSkipTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             marked_skip.skip_marked_queued(store, **args)
 
+    def test_filename_marker_alone_selects_and_non_leftover_queued_rows_are_ignored(self):
+        # The merged crawl policy already skips a filename-marked book, so model
+        # the pre-policy row by renaming the stored path; the tool reads no file.
+        named = self.legacy("Book.cbz")
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET source_path=? WHERE id=?",
+                       (str(self.root / "Book (Uncensored).cbz"), named))
+        other = self.legacy("Plain.cbz", '["uncensored"]')
+        with self.store.connect() as db:  # queued, marked, but not a leftover-pass entry
+            db.execute("UPDATE books SET eligibility_reason='Eligible and queued' WHERE id=?", (other,))
+        report = marked_skip.skip_marked_queued(marked_skip.ExistingStore(self.db_path))
+        self.assertEqual([s["id"] for s in report["samples"]], [named])
+
+    def test_queue_resumed_after_preview_aborts_inside_the_transaction(self):
+        """The transaction repeats the idle guard; a resume after the preview must abort."""
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        original, calls = marked_skip._candidates, []
+        def resumed_after_first(db):
+            calls.append(1)
+            if len(calls) == 1:
+                with self.store.connect() as other:
+                    other.execute("UPDATE controls SET value='running' WHERE name='queue'")
+            return original(db)
+        marked_skip._candidates = resumed_after_first
+        try:
+            before = self.rows()
+            with self.assertRaisesRegex(ValueError, "Pause the queue"):
+                marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                               snapshot_digest=preview["snapshot_digest"])
+            self.assertEqual(self.rows(), before)
+        finally:
+            marked_skip._candidates = original
+
+    def test_row_added_after_the_first_read_aborts_inside_the_transaction(self):
+        """The candidate set is recomputed under BEGIN IMMEDIATE; any drift aborts the whole move."""
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        original, calls = marked_skip._candidates, []
+        def grows_after_first(db):
+            calls.append(1)
+            if len(calls) == 1:
+                rows = original(db)
+                self.legacy("B.cbz", '["decensored"]')
+                self.idle()
+                return rows
+            return original(db)
+        marked_skip._candidates = grows_after_first
+        try:
+            with self.assertRaisesRegex(ValueError, "queue changed"):
+                marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                               snapshot_digest=preview["snapshot_digest"])
+        finally:
+            marked_skip._candidates = original
+        self.assertEqual(sorted(r["state"] for r in self.rows()), ["queued", "queued"])
+
+    def test_cli_makes_no_backup_while_the_queue_runs(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            marked_skip.main(["--db", self.db_path])
+        digest = json.loads(out.getvalue())["snapshot_digest"]
+        with self.store.connect() as db:
+            db.execute("UPDATE controls SET value='running' WHERE name='queue'")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(marked_skip.main(["--db", self.db_path, "--apply", "--expected-count", "1",
+                                               "--snapshot-digest", digest]), 1)
+        self.assertEqual(list(Path(self.db_path).parent.glob("library_backlog.pre-marked-skip-*")), [])
+
     def test_apply_refuses_a_stale_count_digest_or_changed_queue(self):
         self.legacy("A.cbz", '["uncensored"]')
+        self.idle()  # otherwise every refusal below would come from the idle guard instead
         store = marked_skip.ExistingStore(self.db_path)
         preview = marked_skip.skip_marked_queued(store)
         for count, digest in ((2, preview["snapshot_digest"]), (1, "0" * 64), (None, None), (True, preview["snapshot_digest"])):
             with self.assertRaises(ValueError):
                 marked_skip.skip_marked_queued(store, dry_run=False, expected_count=count, snapshot_digest=digest)
         self.legacy("B.cbz", '["decensored"]')  # queue changed after the preview
+        self.idle()
         before = self.rows()
         with self.assertRaises(ValueError):
             marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
