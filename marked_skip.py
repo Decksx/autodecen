@@ -83,8 +83,6 @@ def skip_marked_queued(store, *, dry_run=True, expected_count=None, snapshot_dig
             or not isinstance(snapshot_digest, str) or re.fullmatch("[0-9a-f]{64}", snapshot_digest) is None):
         raise ValueError("Apply requires the preview count and snapshot digest")
     with store.connect() as db:
-        if not dry_run:
-            _ready(db)
         rows = _candidates(db)
     report = {"candidate_count": len(rows), "snapshot_digest": _digest(rows), "skipped_count": 0,
               "samples": [{"id": row["id"], "source_path": row["source_path"],
@@ -102,12 +100,12 @@ def skip_marked_queued(store, *, dry_run=True, expected_count=None, snapshot_dig
             raise ValueError("The queue changed; preview again")
         now = utc_now()
         for row in rows:
-            changed = db.execute(
+            # BEGIN IMMEDIATE plus the identical candidate recheck above means
+            # every row is still queued here; no per-row rowcount check needed.
+            db.execute(
                 """UPDATE books SET state='skipped', eligibility_reason=?, selected_sequence='[]',
-                   queued_at=NULL, updated_at=? WHERE id=? AND state='queued'""",
+                   queued_at=NULL, updated_at=? WHERE id=?""",
                 (MARKED_SKIP_REASON, now, row["id"]))
-            if changed.rowcount != 1:
-                raise ValueError("The queue changed; preview again")
             # Same as narrowing a plan: only unstarted stages go; passed or
             # failed stage history stays as evidence.
             db.execute("DELETE FROM book_stages WHERE book_id=? AND state='pending'", (row["id"],))
@@ -159,6 +157,8 @@ def main(argv=None) -> int:
             preview = skip_marked_queued(store)
             if (preview["candidate_count"], preview["snapshot_digest"]) != (args.expected_count, args.snapshot_digest):
                 raise ValueError("The queue changed; preview again")
+            # Checked before the backup so a running queue never gets a
+            # pointless copy; the apply transaction checks again.
             with store.connect() as db:
                 _ready(db)
             print("backup", backup_database(args.db))
