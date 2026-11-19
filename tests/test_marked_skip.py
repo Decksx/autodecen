@@ -1,0 +1,311 @@
+"""The one-time marked-book move (#6257): exact candidates, guards, atomic apply, no recovery side effect."""
+import io
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout, redirect_stderr
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import marked_skip
+from library_backlog import MARKED_SKIP_REASON, BacklogStore, inspect_cbz_eligibility
+from test_library_backlog import make_cbz
+
+
+class MarkedSkipTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "comix"
+        self.db_path = str(Path(self.temp.name) / "state" / "backlog.sqlite3")
+        self.store = BacklogStore(self.db_path)
+        self.scan = self.store.start_scan(str(self.root))
+
+    def legacy(self, name, tags='["camelia:black_bars"]', title=None):
+        """A row queued for leftover passes before the crawl policy, then carrying the marker."""
+        archive = self.root / name
+        make_cbz(archive, "<ComicInfo><Tags>camelia:black_bars</Tags></ComicInfo>")
+        self.assertEqual(self.store.record_archive(self.scan, str(self.root), str(archive), archive.stat(),
+                                                   inspect_cbz_eligibility), "queued")
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET metadata_tags=?, metadata_title=? WHERE source_path=?",
+                       (tags, title, os.path.abspath(archive)))
+            return db.execute("SELECT id FROM books WHERE source_path=?", (os.path.abspath(archive),)).fetchone()[0]
+
+    def idle(self):
+        """Finish the fixture crawl so the apply-time idle guard can pass."""
+        with self.store.connect() as db:
+            db.execute("UPDATE scans SET status='completed'")
+
+    def rows(self):
+        with self.store.connect() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM books ORDER BY id")]
+
+    def stages(self, book_id):
+        with self.store.connect() as db:
+            return {r["stage"]: r["state"] for r in db.execute("SELECT stage,state FROM book_stages WHERE book_id=?", (book_id,))}
+
+    def test_preview_selects_only_marked_leftover_rows_and_writes_nothing(self):
+        tagged = self.legacy("A.cbz", '["Adult", "uncensored", "camelia:black_bars"]')
+        titled = self.legacy("B.cbz", '["camelia:black_bars"]', title="Series | Decensored")
+        self.legacy("C.cbz")  # method tags only, no marker: stays queued
+        manual = self.legacy("D.cbz", '["uncensored", "camelia:black_bars"]')
+        with self.store.connect() as db:
+            self.store._event(db, "manual_requeue", "operator choice", book_id=manual)
+        before = self.rows()
+        report = marked_skip.skip_marked_queued(marked_skip.ExistingStore(self.db_path))
+        self.assertEqual(report["candidate_count"], 2)
+        self.assertEqual([s["id"] for s in report["samples"]], [tagged, titled])
+        self.assertEqual(self.rows(), before)
+
+    def test_apply_moves_rows_atomically_and_keeps_stage_history(self):
+        book = self.legacy("A.cbz", '["uncensored", "camelia:black_bars"]')
+        with self.store.connect() as db:
+            db.execute("UPDATE book_stages SET state='passed' WHERE book_id=? AND stage='transparent_black'", (book,))
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        report = marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                                snapshot_digest=preview["snapshot_digest"])
+        self.assertEqual(report["skipped_count"], 1)
+        row = [r for r in self.rows() if r["id"] == book][0]
+        self.assertEqual((row["state"], row["eligibility_reason"], row["selected_sequence"], row["queued_at"]),
+                         ("skipped", MARKED_SKIP_REASON, "[]", None))
+        self.assertEqual(self.stages(book), {"transparent_black": "passed"})
+        self.assertIsNone(self.store.claim_job())
+        with self.store.connect() as db:
+            events = [r[0] for r in db.execute("SELECT event_type FROM events WHERE event_type LIKE 'marked_policy_skip%'")]
+        self.assertEqual(sorted(events), ["marked_policy_skip", "marked_policy_skip_batch"])
+
+    def test_apply_refuses_running_queue_processing_book_and_running_scan(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        args = dict(dry_run=False, expected_count=1, snapshot_digest=preview["snapshot_digest"])
+        for setup in ("UPDATE controls SET value='running' WHERE name='queue'",
+                      "UPDATE scans SET status='running'"):
+            with self.subTest(setup=setup):
+                with self.store.connect() as db:
+                    db.execute("UPDATE controls SET value='paused' WHERE name='queue'")
+                    db.execute("UPDATE scans SET status='completed'")
+                    db.execute(setup)
+                before = self.rows()
+                with self.assertRaises(ValueError):
+                    marked_skip.skip_marked_queued(store, **args)
+                self.assertEqual(self.rows(), before)
+        with self.store.connect() as db:
+            db.execute("UPDATE scans SET status='completed'")
+        self.legacy("P.cbz")
+        self.assertIsNotNone(self.store.claim_job())  # one book now processing
+        with self.assertRaises(ValueError):
+            marked_skip.skip_marked_queued(store, **args)
+
+    def test_filename_marker_alone_selects_and_non_leftover_queued_rows_are_ignored(self):
+        # The merged crawl policy already skips a filename-marked book, so model
+        # the pre-policy row by renaming the stored path; the tool reads no file.
+        named = self.legacy("Book.cbz")
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET source_path=? WHERE id=?",
+                       (str(self.root / "Book (Uncensored).cbz"), named))
+        other = self.legacy("Plain.cbz", '["uncensored"]')
+        with self.store.connect() as db:  # queued, marked, but not a leftover-pass entry
+            db.execute("UPDATE books SET eligibility_reason='Eligible and queued' WHERE id=?", (other,))
+        report = marked_skip.skip_marked_queued(marked_skip.ExistingStore(self.db_path))
+        self.assertEqual([s["id"] for s in report["samples"]], [named])
+
+    def test_queue_resumed_after_preview_aborts_inside_the_transaction(self):
+        """The transaction repeats the idle guard; a resume after the preview must abort."""
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        original, calls = marked_skip._candidates, []
+        def resumed_after_first(db):
+            calls.append(1)
+            if len(calls) == 1:
+                with self.store.connect() as other:
+                    other.execute("UPDATE controls SET value='running' WHERE name='queue'")
+            return original(db)
+        marked_skip._candidates = resumed_after_first
+        try:
+            before = self.rows()
+            with self.assertRaisesRegex(ValueError, "Pause or stop the queue"):
+                marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                               snapshot_digest=preview["snapshot_digest"])
+            self.assertEqual(self.rows(), before)
+        finally:
+            marked_skip._candidates = original
+
+    def test_row_added_after_the_first_read_aborts_inside_the_transaction(self):
+        """The candidate set is recomputed under BEGIN IMMEDIATE; any drift aborts the whole move."""
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        original, calls = marked_skip._candidates, []
+        def grows_after_first(db):
+            calls.append(1)
+            if len(calls) == 1:
+                rows = original(db)
+                self.legacy("B.cbz", '["decensored"]')
+                self.idle()
+                return rows
+            return original(db)
+        marked_skip._candidates = grows_after_first
+        try:
+            with self.assertRaisesRegex(ValueError, "queue changed"):
+                marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                               snapshot_digest=preview["snapshot_digest"])
+        finally:
+            marked_skip._candidates = original
+        self.assertEqual(sorted(r["state"] for r in self.rows()), ["queued", "queued"])
+
+    def test_preview_leaves_a_delete_mode_database_byte_identical(self):
+        """Preview must not run write pragmas: a DELETE-journal DB stays DELETE and unchanged."""
+        self.legacy("A.cbz", '["uncensored"]')
+        raw = sqlite3.connect(self.db_path)
+        self.assertEqual(raw.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        raw.close()
+        before = Path(self.db_path).read_bytes()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(marked_skip.main(["--db", self.db_path]), 0)
+        self.assertEqual(Path(self.db_path).read_bytes(), before)
+        raw = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        self.assertEqual(raw.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        raw.close()
+
+    def test_missing_or_unknown_queue_control_fails_closed(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        for setup in ("DELETE FROM controls WHERE name='queue'",
+                      "UPDATE controls SET value='unknown' WHERE name='queue'"):
+            with self.subTest(setup=setup):
+                with self.store.connect() as db:
+                    db.execute("INSERT OR IGNORE INTO controls(name,value,updated_at) VALUES('queue','paused','x')")
+                    db.execute(setup)
+                before = self.rows()
+                with self.assertRaisesRegex(ValueError, "Pause or stop the queue"):
+                    marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                                   snapshot_digest=preview["snapshot_digest"])
+                self.assertEqual(self.rows(), before)
+        with self.store.connect() as db:
+            db.execute("UPDATE controls SET value='stopped' WHERE name='queue'")
+        self.assertEqual(marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                                        snapshot_digest=preview["snapshot_digest"])["skipped_count"], 1)
+
+    def test_unrelated_processing_book_blocks_apply(self):
+        """A book being processed that is not a candidate leaves the candidate set unchanged."""
+        self.legacy("A.cbz", '["uncensored"]')
+        other = self.legacy("Unmarked.cbz")
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET state='processing' WHERE id=?", (other,))
+        self.assertEqual(marked_skip.skip_marked_queued(store)["snapshot_digest"], preview["snapshot_digest"])
+        with self.assertRaisesRegex(ValueError, "current book"):
+            marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                           snapshot_digest=preview["snapshot_digest"])
+
+    def test_write_reservation_fences_a_late_manual_requeue(self):
+        """BEGIN IMMEDIATE must block an operator's manual choice arriving mid-apply."""
+        book = self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        original, calls, writer = marked_skip._candidates, [], []
+        def late_manual_writer(db):
+            calls.append(1)
+            rows = original(db)
+            if len(calls) == 2:  # the in-transaction read
+                late = sqlite3.connect(self.db_path, timeout=0.2)
+                try:
+                    late.execute("INSERT INTO events(scan_id,book_id,event_type,message,created_at) "
+                                 "VALUES(NULL,?,'manual_requeue','late operator choice','x')", (book,))
+                    late.commit()
+                    writer.append("committed")
+                except sqlite3.OperationalError as error:
+                    writer.append(str(error))
+                finally:
+                    late.close()
+            return rows
+        marked_skip._candidates = late_manual_writer
+        try:
+            marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                           snapshot_digest=preview["snapshot_digest"])
+        finally:
+            marked_skip._candidates = original
+        self.assertEqual(len(writer), 1)
+        self.assertIn("locked", writer[0])
+
+    def test_cli_makes_no_backup_while_the_queue_runs(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            marked_skip.main(["--db", self.db_path])
+        digest = json.loads(out.getvalue())["snapshot_digest"]
+        with self.store.connect() as db:
+            db.execute("UPDATE controls SET value='running' WHERE name='queue'")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(marked_skip.main(["--db", self.db_path, "--apply", "--expected-count", "1",
+                                               "--snapshot-digest", digest]), 1)
+        self.assertEqual(list(Path(self.db_path).parent.glob("library_backlog.pre-marked-skip-*")), [])
+
+    def test_apply_refuses_a_stale_count_digest_or_changed_queue(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()  # otherwise every refusal below would come from the idle guard instead
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        for count, digest in ((2, preview["snapshot_digest"]), (1, "0" * 64), (None, None), (True, preview["snapshot_digest"])):
+            with self.assertRaises(ValueError):
+                marked_skip.skip_marked_queued(store, dry_run=False, expected_count=count, snapshot_digest=digest)
+        self.legacy("B.cbz", '["decensored"]')  # queue changed after the preview
+        self.idle()
+        before = self.rows()
+        with self.assertRaises(ValueError):
+            marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                           snapshot_digest=preview["snapshot_digest"])
+        self.assertEqual(self.rows(), before)
+
+    def test_existing_store_never_runs_interrupted_work_recovery(self):
+        """BacklogStore() would mark Camelia's in-flight book interrupted; the tool must not."""
+        self.legacy("A.cbz", '["uncensored"]')
+        self.legacy("P.cbz")
+        job = self.store.claim_job()
+        processing = [r["id"] for r in self.rows() if r["state"] == "processing"]
+        self.assertEqual(processing, [job["id"]])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(marked_skip.main(["--db", self.db_path]), 0)
+        self.assertEqual([r["id"] for r in self.rows() if r["state"] == "processing"], processing)
+
+    def test_cli_preview_then_apply_backs_up_first(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(marked_skip.main(["--db", self.db_path]), 0)
+        preview = json.loads(out.getvalue())
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(marked_skip.main(["--db", self.db_path, "--apply", "--expected-count", "2",
+                                               "--snapshot-digest", preview["snapshot_digest"]]), 1)
+        self.assertIn("Refused", err.getvalue())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(marked_skip.main(["--db", self.db_path, "--apply", "--expected-count", "1",
+                                               "--snapshot-digest", preview["snapshot_digest"]]), 0)
+        backups = list(Path(self.db_path).parent.glob("library_backlog.pre-marked-skip-*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("backup", out.getvalue())
+        self.assertEqual([r["state"] for r in self.rows()], ["skipped"])
+
+
+if __name__ == "__main__":
+    unittest.main()
