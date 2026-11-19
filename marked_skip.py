@@ -11,9 +11,12 @@ or filename carries the marker. Rows an operator queued explicitly
 (``manual_requeue`` event) are never touched: manual extra passes stay a
 deliberate choice.
 
-Preview is read-only. Apply needs the preview's count and snapshot digest,
-the queue paused with nothing processing or crawling, and repeats every check
-inside one ``BEGIN IMMEDIATE`` transaction. The CLI backs up the database and
+Preview opens the database read-only (``mode=ro``, no pragmas) and changes no
+byte of it. Apply needs the preview's count and snapshot digest, the queue
+control present and ``paused`` or ``stopped`` (missing or unknown values
+refuse), nothing processing or crawling, and repeats every check inside one
+``BEGIN IMMEDIATE`` transaction, whose write reservation also fences a late
+manual requeue. The CLI backs up the database and
 verifies the copy before applying. No archive file is read or changed.
 """
 import argparse
@@ -36,10 +39,14 @@ _ROWS = """SELECT b.id, b.source_path, b.state, b.updated_at, b.selected_sequenc
            ORDER BY b.id"""
 
 
+IDLE_QUEUE_VALUES = ("paused", "stopped")  # control_queue's non-running states
+
+
 def _ready(db):
-    """Same idle conditions as backlog_prune, with this tool's own wording."""
-    if db.execute("SELECT 1 FROM controls WHERE name='queue' AND value='running'").fetchone():
-        raise ValueError("Pause the queue before skipping marked books")
+    """Fail closed: a missing or unrecognized queue control is not proof of idleness."""
+    control = db.execute("SELECT value FROM controls WHERE name='queue'").fetchone()
+    if control is None or control[0] not in IDLE_QUEUE_VALUES:
+        raise ValueError("Pause or stop the queue before skipping marked books")
     if db.execute("SELECT 1 FROM books WHERE state='processing' LIMIT 1").fetchone():
         raise ValueError("Wait for the current book to finish before skipping marked books")
     if db.execute("SELECT 1 FROM scans WHERE status='running' LIMIT 1").fetchone():
@@ -71,6 +78,24 @@ def _candidates(db) -> list[dict]:
     return [dict(row) for row in db.execute(_ROWS) if _marked(row)]
 
 
+def _read_only_candidates(database_path: str) -> list[dict]:
+    """One coherent snapshot through a read-only connection with no pragmas.
+
+    BacklogStore.connect sets journal_mode=WAL, which would rewrite a database
+    the operator only asked to preview.
+    """
+    db = sqlite3.connect(f"file:{os.path.abspath(database_path)}?mode=ro", uri=True, timeout=30)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN")
+        try:
+            return _candidates(db)
+        finally:
+            db.rollback()
+    finally:
+        db.close()
+
+
 def _digest(rows) -> str:
     return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -82,8 +107,7 @@ def skip_marked_queued(store, *, dry_run=True, expected_count=None, snapshot_dig
     if not dry_run and (type(expected_count) is not int or expected_count < 0
             or not isinstance(snapshot_digest, str) or re.fullmatch("[0-9a-f]{64}", snapshot_digest) is None):
         raise ValueError("Apply requires the preview count and snapshot digest")
-    with store.connect() as db:
-        rows = _candidates(db)
+    rows = _read_only_candidates(store.database_path)
     report = {"candidate_count": len(rows), "snapshot_digest": _digest(rows), "skipped_count": 0,
               "samples": [{"id": row["id"], "source_path": row["source_path"],
                            "selected_sequence": json.loads(row["selected_sequence"])} for row in rows[:20]]}
@@ -159,8 +183,11 @@ def main(argv=None) -> int:
                 raise ValueError("The queue changed; preview again")
             # Checked before the backup so a running queue never gets a
             # pointless copy; the apply transaction checks again.
-            with store.connect() as db:
-                _ready(db)
+            check = sqlite3.connect(f"file:{os.path.abspath(args.db)}?mode=ro", uri=True, timeout=30)
+            try:
+                _ready(check)
+            finally:
+                check.close()
             print("backup", backup_database(args.db))
             report = skip_marked_queued(store, dry_run=False, expected_count=args.expected_count,
                                         snapshot_digest=args.snapshot_digest)
