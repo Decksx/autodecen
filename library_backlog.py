@@ -28,6 +28,11 @@ from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger(__name__)
 PROCESSED_MARKERS = ("uncensored", "decensored")
+# Operator policy (David, hive #6257, 2026-11-19): the automatic crawl never
+# queues extra passes for a book already marked uncensored/decensored, even if
+# its Camelia method tags show some passes were not run. Manual requeue keeps
+# the per-method behaviour, so an operator can still choose extra passes.
+MARKED_SKIP_REASON = "Already marked uncensored/decensored; extra passes are not queued automatically"
 # Tower is now the receive-only replica. Keep its existing rows as history,
 # but never offer or validate it as a new/resumed crawl destination.
 DEFAULT_ROOTS = (r"X:\comix",)
@@ -840,11 +845,15 @@ class BacklogStore:
         # ZIP I/O happens outside the write transaction.
         inspection = inspector(normalized)
         sequence = pending_decensor_methods(inspection, DEFAULT_SEQUENCE)
-        state = "queued" if sequence else "skipped"
         reason = inspection.get("reason")
         if inspection.get("applied_methods"):
             reason = (f"Pending methods: {', '.join(sequence)}" if sequence else
                       "All decensor methods already recorded")
+        if sequence and inspection.get("already_processed"):
+            # Checked after the method-tag reason so a fully recorded book keeps
+            # its more specific "All decensor methods already recorded" reason.
+            sequence, reason = [], MARKED_SKIP_REASON
+        state = "queued" if sequence else "skipped"
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             prior = self._source_row(db, normalized)
