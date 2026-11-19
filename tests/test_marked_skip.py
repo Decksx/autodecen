@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -132,7 +133,7 @@ class MarkedSkipTests(unittest.TestCase):
         marked_skip._candidates = resumed_after_first
         try:
             before = self.rows()
-            with self.assertRaisesRegex(ValueError, "Pause the queue"):
+            with self.assertRaisesRegex(ValueError, "Pause or stop the queue"):
                 marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
                                                snapshot_digest=preview["snapshot_digest"])
             self.assertEqual(self.rows(), before)
@@ -162,6 +163,86 @@ class MarkedSkipTests(unittest.TestCase):
         finally:
             marked_skip._candidates = original
         self.assertEqual(sorted(r["state"] for r in self.rows()), ["queued", "queued"])
+
+    def test_preview_leaves_a_delete_mode_database_byte_identical(self):
+        """Preview must not run write pragmas: a DELETE-journal DB stays DELETE and unchanged."""
+        self.legacy("A.cbz", '["uncensored"]')
+        raw = sqlite3.connect(self.db_path)
+        self.assertEqual(raw.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        raw.close()
+        before = Path(self.db_path).read_bytes()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(marked_skip.main(["--db", self.db_path]), 0)
+        self.assertEqual(Path(self.db_path).read_bytes(), before)
+        raw = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        self.assertEqual(raw.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        raw.close()
+
+    def test_missing_or_unknown_queue_control_fails_closed(self):
+        self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        for setup in ("DELETE FROM controls WHERE name='queue'",
+                      "UPDATE controls SET value='unknown' WHERE name='queue'"):
+            with self.subTest(setup=setup):
+                with self.store.connect() as db:
+                    db.execute("INSERT OR IGNORE INTO controls(name,value,updated_at) VALUES('queue','paused','x')")
+                    db.execute(setup)
+                before = self.rows()
+                with self.assertRaisesRegex(ValueError, "Pause or stop the queue"):
+                    marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                                   snapshot_digest=preview["snapshot_digest"])
+                self.assertEqual(self.rows(), before)
+        with self.store.connect() as db:
+            db.execute("UPDATE controls SET value='stopped' WHERE name='queue'")
+        self.assertEqual(marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                                        snapshot_digest=preview["snapshot_digest"])["skipped_count"], 1)
+
+    def test_unrelated_processing_book_blocks_apply(self):
+        """A book being processed that is not a candidate leaves the candidate set unchanged."""
+        self.legacy("A.cbz", '["uncensored"]')
+        other = self.legacy("Unmarked.cbz")
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET state='processing' WHERE id=?", (other,))
+        self.assertEqual(marked_skip.skip_marked_queued(store)["snapshot_digest"], preview["snapshot_digest"])
+        with self.assertRaisesRegex(ValueError, "current book"):
+            marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                           snapshot_digest=preview["snapshot_digest"])
+
+    def test_write_reservation_fences_a_late_manual_requeue(self):
+        """BEGIN IMMEDIATE must block an operator's manual choice arriving mid-apply."""
+        book = self.legacy("A.cbz", '["uncensored"]')
+        self.idle()
+        store = marked_skip.ExistingStore(self.db_path)
+        preview = marked_skip.skip_marked_queued(store)
+        original, calls, writer = marked_skip._candidates, [], []
+        def late_manual_writer(db):
+            calls.append(1)
+            rows = original(db)
+            if len(calls) == 2:  # the in-transaction read
+                late = sqlite3.connect(self.db_path, timeout=0.2)
+                try:
+                    late.execute("INSERT INTO events(scan_id,book_id,event_type,message,created_at) "
+                                 "VALUES(NULL,?,'manual_requeue','late operator choice','x')", (book,))
+                    late.commit()
+                    writer.append("committed")
+                except sqlite3.OperationalError as error:
+                    writer.append(str(error))
+                finally:
+                    late.close()
+            return rows
+        marked_skip._candidates = late_manual_writer
+        try:
+            marked_skip.skip_marked_queued(store, dry_run=False, expected_count=1,
+                                           snapshot_digest=preview["snapshot_digest"])
+        finally:
+            marked_skip._candidates = original
+        self.assertEqual(len(writer), 1)
+        self.assertIn("locked", writer[0])
 
     def test_cli_makes_no_backup_while_the_queue_runs(self):
         self.legacy("A.cbz", '["uncensored"]')
