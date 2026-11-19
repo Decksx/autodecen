@@ -16,6 +16,8 @@ from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 from library_backlog import (
+    DEFAULT_SEQUENCE,
+    MARKED_SKIP_REASON,
     BacklogStore,
     LibraryBacklog,
     SourcePreparationRefused,
@@ -1508,19 +1510,58 @@ class LibraryBacklogTests(unittest.TestCase):
             self.assertEqual(pending_decensor_methods(inspection, ["mosaic"]), [])
             self.assertEqual(pending_decensor_methods(inspection, ["mosaic"], True), ["mosaic"])
 
-    def test_backlog_queues_only_methods_not_recorded(self):
+    def test_crawl_skips_marked_book_but_manual_requeue_still_queues_missing_methods(self):
+        """David's policy (#6257): the crawl never queues extra passes for a marked book.
+
+        The book carries ``uncensored`` plus one method tag, so three passes are
+        technically unrecorded. The crawl must skip it with the policy reason;
+        an explicit manual requeue must still queue exactly the missing methods.
+        """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "comix"
             archive = root / "Book.cbz"
             make_cbz(archive, "<ComicInfo><Tags>uncensored, camelia:black_bars</Tags></ComicInfo>")
             store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
             scan_id = store.start_scan(str(root))
-            self.assertEqual(store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility), "queued")
+            self.assertEqual(store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility), "skipped")
+            self.assertIsNone(store.claim_job())
+            with store.connect() as db:
+                row = db.execute("SELECT state, eligibility_reason, selected_sequence FROM books").fetchone()
+            self.assertEqual((row["state"], row["eligibility_reason"]), ("skipped", MARKED_SKIP_REASON))
+            self.assertEqual(json.loads(row["selected_sequence"]), [])
+            # The manual path keeps its per-method behaviour.
+            self.assertEqual(store.requeue_book(str(archive), DEFAULT_SEQUENCE),
+                             ["transparent_black", "white_bars", "mosaic"])
             job = store.claim_job()
             self.assertEqual(json.loads(job["selected_sequence"]), ["transparent_black", "white_bars", "mosaic"])
             progress = store.book_progress(str(archive))
             self.assertEqual(progress["stages"][0]["state"], "not_selected")
             self.assertTrue(progress["stages"][0]["recorded_tag"])
+
+    def test_crawl_still_queues_an_unmarked_book_with_partial_method_tags(self):
+        """Only the uncensored/decensored marker triggers the skip, not method tags alone."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            make_cbz(archive, "<ComicInfo><Tags>camelia:black_bars</Tags></ComicInfo>")
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            self.assertEqual(store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility), "queued")
+            job = store.claim_job()
+            self.assertEqual(json.loads(job["selected_sequence"]), ["transparent_black", "white_bars", "mosaic"])
+
+    def test_fully_recorded_marked_book_keeps_its_specific_skip_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "comix"
+            archive = root / "Book.cbz"
+            tags = ", ".join(["uncensored", *(f"camelia:{method}" for method in DEFAULT_SEQUENCE)])
+            make_cbz(archive, f"<ComicInfo><Tags>{tags}</Tags></ComicInfo>")
+            store = BacklogStore(str(Path(directory) / "state" / "backlog.sqlite3"))
+            scan_id = store.start_scan(str(root))
+            self.assertEqual(store.record_archive(scan_id, str(root), str(archive), archive.stat(), inspect_cbz_eligibility), "skipped")
+            with store.connect() as db:
+                reason = db.execute("SELECT eligibility_reason FROM books").fetchone()[0]
+            self.assertEqual(reason, "All decensor methods already recorded")
 
     def test_manual_backlog_override_can_requeue_legacy_book(self):
         with tempfile.TemporaryDirectory() as directory:
