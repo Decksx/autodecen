@@ -1,8 +1,9 @@
 """GUI 'Reset statistics' (David, hive #6698, option A): counters restart, no book record changes.
 
-The reset stores a per-outcome baseline and the last scan id, so neither an
-unchanged rescan (which refreshes updated_at) nor same-second timestamps can
-bring old outcomes back (codex-lead review of f573ea0).
+After a reset the outcome tiles count transitions into each outcome state,
+logged by triggers with an auto-increment id. So an unchanged rescan (which
+refreshes updated_at), same-second activity, and old books leaving a state all
+behave correctly (codex-lead reviews of f573ea0 and c77ac4f).
 """
 import sys
 import tempfile
@@ -102,6 +103,45 @@ class StatisticsResetTests(unittest.TestCase):
         reset_at = self.store.reset_statistics()
         self.add_scan(7, 3, 1, created=reset_at)
         self.assertEqual(self.store.snapshot()["scan_totals"], {"found": 7, "scanned": 3, "eligible": 1})
+
+    def test_a_new_outcome_counts_even_after_an_old_book_left_that_state(self):
+        """Codex review of c77ac4f: net inventory would show 0 here; a real new skip happened."""
+        self.store.reset_statistics()
+        self.set_state(8, "queued")    # an old skipped book is requeued
+        self.set_state(1, "skipped")   # a queued book is newly skipped
+        self.assertEqual(self.counts()["skipped"], 1)
+
+    def test_a_retried_failure_counts_again(self):
+        """An old failed book retried and failing again is a new failure after the reset."""
+        self.store.reset_statistics()
+        self.set_state(6, "queued")
+        self.set_state(6, "failed")
+        self.assertEqual((self.counts()["failed"], self.counts()["queued"]), (1, 2))
+
+    def test_rewriting_a_state_to_the_same_value_logs_nothing(self):
+        """Re-registration writes state=? even when unchanged; that's not a new outcome."""
+        self.store.reset_statistics()
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET state=state, updated_at=?", (library_backlog.utc_now(),))
+        for state in ("completed", "failed", "quarantined", "skipped"):
+            self.assertEqual(self.counts()[state], 0, state)
+
+    def test_crawl_inserting_a_skipped_row_counts(self):
+        self.store.reset_statistics()
+        with self.store.connect() as db:
+            db.execute("""INSERT INTO books(source_path,root_path,file_size,mtime_ns,state,selected_sequence,
+                          discovered_at,updated_at,source_key) VALUES('X:\\comix\\N\\n.cbz','X:\\comix',1,1,'skipped','[]',?,?,
+                          'x:\\comix\\n\\n.cbz')""", (OLD, OLD))
+        self.assertEqual(self.counts()["skipped"], 1)
+
+    def test_reset_prunes_the_log_up_to_its_boundary(self):
+        self.store.reset_statistics()
+        self.set_state(1, "completed")
+        self.store.reset_statistics()
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outcome_log").fetchone()[0], 0)
+        self.set_state(2, "completed")
+        self.assertEqual(self.counts()["completed"], 1)
 
     def test_leaving_an_outcome_state_never_goes_negative(self):
         self.store.reset_statistics()
