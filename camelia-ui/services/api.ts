@@ -125,6 +125,10 @@ export interface LibraryBacklogStatus {
         next_window_at: string | null;
     };
     counts: Record<'discovered' | 'eligible' | 'queued' | 'held' | 'processing' | 'completed' | 'failed' | 'quarantined' | 'skipped', number>;
+    /** When "Reset statistics" was last pressed; outcome counters count from then. */
+    stats_reset_at?: string | null;
+    /** Latest scan's counters, zero until a scan starts after the last reset. */
+    scan_totals?: { found: number; scanned: number; eligible: number };
     current_file: string | null;
     current_stage: string | null;
     recent_books: LibraryBookProgress[];
@@ -241,6 +245,11 @@ export async function controlLibraryScan(
     action: 'pause' | 'resume' | 'stop'
 ): Promise<void> {
     await backlogRequest(`/scan/${scanId}/${action}`, { method: 'POST' });
+}
+
+/** Restart the displayed outcome counters from zero; no book record changes. */
+export async function resetLibraryStatistics(): Promise<void> {
+    await backlogRequest('/stats/reset', { method: 'POST' });
 }
 
 export async function controlLibraryQueue(action: 'pause' | 'resume' | 'stop' | 'cancel-current'): Promise<void> {
