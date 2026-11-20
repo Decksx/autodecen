@@ -35,6 +35,12 @@
                     <div class="text-xl text-foam">{{ item.value }}</div>
                 </div>
             </div>
+            <div class="flex items-center gap-3 text-xs text-subtle">
+                <button class="rounded-md px-3 py-1 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-40 bg-overlay text-text" :disabled="busy" @click="resetStatistics()">
+                    Reset statistics
+                </button>
+                <span>{{ status?.stats_reset_at ? `Counting since ${new Date(status.stats_reset_at).toLocaleString()}` : 'Counting all history' }}. Queued always shows the real queue.</span>
+            </div>
 
             <div class="rounded-md bg-base border border-overlay p-4 space-y-2 text-sm">
                 <div class="flex flex-wrap gap-x-6 gap-y-1">
@@ -222,6 +228,7 @@ import {
     getLibraryBacklog,
     getLibraryBookProgress,
     requeueLibraryBook,
+    resetLibraryStatistics,
     startLibraryScan
 } from '@/services/api';
 import type { LibraryBacklogStatus, LibraryBookProgress, ProcessingType } from '@/services/api';
@@ -266,9 +273,10 @@ const visibleBooks = computed<LibraryBookProgress[]>(() => {
         ? [lookedUpBook.value, ...recent] : recent;
 });
 const totals = computed(() => [
-    { label: 'Found', value: scan.value?.total_found ?? 0 },
-    { label: 'Scanned', value: scan.value?.scanned_count ?? 0 },
-    { label: 'Eligible', value: scan.value?.eligible_count ?? 0 },
+    // The server zeroes these until a scan starts after the last reset.
+    { label: 'Found', value: status.value?.scan_totals?.found ?? scan.value?.total_found ?? 0 },
+    { label: 'Scanned', value: status.value?.scan_totals?.scanned ?? scan.value?.scanned_count ?? 0 },
+    { label: 'Eligible', value: status.value?.scan_totals?.eligible ?? scan.value?.eligible_count ?? 0 },
     { label: 'Queued', value: status.value?.counts.queued ?? 0 },
     { label: 'Completed', value: status.value?.counts.completed ?? 0 },
     { label: 'Failed', value: status.value?.counts.failed ?? 0 },
@@ -309,6 +317,13 @@ function startScan(): void {
 function scanAction(action: 'pause' | 'stop'): void {
     if (!scan.value) return;
     void run(() => controlLibraryScan(scan.value!.id, action));
+}
+
+function resetStatistics(): void {
+    if (!window.confirm('Reset the statistics to zero? This only changes the counters; no book or queue entry is touched.')) {
+        return;
+    }
+    void run(() => resetLibraryStatistics());
 }
 
 function queueAction(action: 'pause' | 'resume' | 'stop' | 'cancel-current'): void {
