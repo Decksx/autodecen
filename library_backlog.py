@@ -51,6 +51,8 @@ IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp",
 QUEUE_PRIORITY_VERSION = 3
 DEFER_PAGE_COUNT = 350
 DEFER_SERIES_BOOK_COUNT = 6
+# Cumulative outcome states that the GUI's "Reset statistics" restarts from zero.
+OUTCOME_STATES = ("completed", "failed", "quarantined", "skipped")
 METHOD_TAG_PREFIX = "camelia:"
 PREVIOUS_DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars")
 ACTIVE_STATES = ("queued", "processing")
@@ -586,6 +588,27 @@ class BacklogStore:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                -- Display-only log of books *entering* an outcome state, for the
+                -- GUI's "Reset statistics". The AUTOINCREMENT id orders every
+                -- transition exactly, so a reset needs no timestamps. Triggers
+                -- catch every write path (crawl inserts, worker updates, direct
+                -- SQL) without touching any of them. An unchanged rescan changes
+                -- no state and so logs nothing.
+                CREATE TABLE IF NOT EXISTS outcome_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS outcome_log_insert AFTER INSERT ON books
+                WHEN NEW.state IN ('completed','failed','quarantined','skipped')
+                BEGIN
+                    INSERT INTO outcome_log(book_id, state) VALUES (NEW.id, NEW.state);
+                END;
+                CREATE TRIGGER IF NOT EXISTS outcome_log_update AFTER UPDATE OF state ON books
+                WHEN NEW.state IN ('completed','failed','quarantined','skipped') AND NEW.state IS NOT OLD.state
+                BEGIN
+                    INSERT INTO outcome_log(book_id, state) VALUES (NEW.id, NEW.state);
+                END;
                 """
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(books)")}
@@ -943,6 +966,48 @@ class BacklogStore:
         with self.connect() as db:
             row = db.execute("SELECT value FROM controls WHERE name='known_types_only'").fetchone()
             return bool(row and row["value"] == "enabled")
+
+    def statistics_reset_at(self) -> str | None:
+        """When the GUI statistics were last reset, or None if never."""
+        reset = self._statistics_baseline()
+        return reset["at"] if reset else None
+
+    def _statistics_baseline(self, db=None) -> dict | None:
+        """The stored reset: its time and the last outcome_log and scan ids at that moment."""
+        if db is None:
+            with self.connect() as own:
+                return self._statistics_baseline(own)
+        row = db.execute("SELECT value FROM controls WHERE name='stats_reset'").fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def reset_statistics(self) -> str:
+        """Start the GUI's outcome counters from zero (David, hive #6698, option A).
+
+        Only what the counters display changes: no book row, state, stage or
+        event is altered, so the queue and the marked-book skip are untouched.
+
+        After a reset, Completed/Failed/Issues/Skipped count **transitions into**
+        those states logged in ``outcome_log`` after the reset, and
+        Found/Scanned/Eligible show only scans with a higher id. Both boundaries
+        are auto-increment ids taken in one ``BEGIN IMMEDIATE`` transaction, so
+        they order exactly. Neither timestamps (an unchanged rescan refreshes
+        ``updated_at``; whole seconds can't order same-second activity) nor net
+        state counts (an old book leaving a state would hide a new one entering
+        it) are used. Queued, held and processing always show the real queue.
+        Log rows at or before the boundary are deleted, so the log stays small.
+        """
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            last_outcome = db.execute("SELECT COALESCE(MAX(id), 0) FROM outcome_log").fetchone()[0]
+            last_scan = db.execute("SELECT COALESCE(MAX(id), 0) FROM scans").fetchone()[0]
+            db.execute("DELETE FROM outcome_log WHERE id <= ?", (last_outcome,))
+            value = json.dumps({"at": now, "outcome_id": last_outcome, "scan_id": last_scan})
+            db.execute("INSERT INTO controls(name,value,updated_at) VALUES('stats_reset',?,?) "
+                       "ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                       (value, now))
+            self._event(db, "statistics_reset", "GUI statistics reset; counters start from zero")
+        return now
 
     def control_known_types_only(self, enabled: bool) -> None:
         with self.connect() as db:
@@ -1670,8 +1735,19 @@ class BacklogStore:
 
     def snapshot(self, event_limit: int = 100) -> dict:
         with self.connect() as db:
+            reset = self._statistics_baseline(db)
+            reset_at = reset["at"] if reset else None
             scan = db.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
             counts = {row["state"]: row["count"] for row in db.execute("SELECT state,COUNT(*) AS count FROM books GROUP BY state")}
+            if reset:
+                # Outcome states count transitions logged after the reset
+                # boundary. Active states always count the real queue.
+                since = {row["state"]: row["count"] for row in db.execute(
+                    "SELECT state, COUNT(*) AS count FROM outcome_log WHERE id > ? GROUP BY state",
+                    (reset["outcome_id"],))}
+                for state in OUTCOME_STATES:
+                    counts[state] = since.get(state, 0)
+            scan_after_reset = scan is not None and (reset is None or scan["id"] > reset["scan_id"])
             current = db.execute("SELECT source_path,current_stage FROM books WHERE state='processing' ORDER BY started_at LIMIT 1").fetchone()
             recent = db.execute(
                 """SELECT * FROM books WHERE state IN ('processing','completed','failed','quarantined')
@@ -1694,6 +1770,12 @@ class BacklogStore:
                     **processing_window_status(),
                 },
                 "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "held", "processing", "completed", "failed", "quarantined", "skipped")},
+                "stats_reset_at": reset_at,
+                "scan_totals": {
+                    "found": scan["total_found"] if scan_after_reset else 0,
+                    "scanned": scan["scanned_count"] if scan_after_reset else 0,
+                    "eligible": scan["eligible_count"] if scan_after_reset else 0,
+                },
                 "current_file": (
                     current["source_path"] if current else
                     scan["current_path"] if scan and scan["status"] in {"running", "paused"} else None

@@ -1837,6 +1837,15 @@ def control_library_detection_mode():
     return jsonify({"success": True, "known_types_only": library_backlog.store.known_types_only()})
 
 
+@app.route('/api/library-backlog/stats/reset', methods=['POST'])
+def reset_library_statistics():
+    """Restart the GUI's outcome counters from zero; no book record changes."""
+    blocked = _local_backlog_request()
+    if blocked:
+        return blocked
+    return jsonify({"success": True, "stats_reset_at": library_backlog.store.reset_statistics()})
+
+
 @app.route('/api/library-backlog/schedule', methods=['POST'])
 def control_library_schedule():
     blocked = _local_backlog_request()
