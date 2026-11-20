@@ -948,24 +948,43 @@ class BacklogStore:
 
     def statistics_reset_at(self) -> str | None:
         """When the GUI statistics were last reset, or None if never."""
-        with self.connect() as db:
-            row = db.execute("SELECT value FROM controls WHERE name='stats_reset_at'").fetchone()
-            return row["value"] if row else None
+        reset = self._statistics_baseline()
+        return reset["at"] if reset else None
+
+    def _statistics_baseline(self, db=None) -> dict | None:
+        """The stored reset: its time, per-outcome counts and last scan id at reset."""
+        if db is None:
+            with self.connect() as own:
+                return self._statistics_baseline(own)
+        row = db.execute("SELECT value FROM controls WHERE name='stats_reset'").fetchone()
+        return json.loads(row["value"]) if row else None
 
     def reset_statistics(self) -> str:
         """Start the GUI's outcome counters from zero (David, hive #6698, option A).
 
         Only what the counters display changes: no book row, state, stage or
         event is altered, so the queue and the marked-book skip are untouched.
-        After a reset, Completed/Failed/Issues/Skipped count books whose state
-        changed since then, and Found/Scanned/Eligible count only later scans.
-        Queued, held and processing always show the real queue.
+
+        The reset stores a **baseline**, not a timestamp: the count in each
+        outcome state and the highest scan id at that moment. The display then
+        shows ``current - baseline`` (never below zero) and only scans with a
+        higher id. Timestamps can't be used: an unchanged rescan refreshes a
+        row's ``updated_at``, and whole-second times can't order a reset against
+        same-second activity. Queued, held and processing always show the real
+        queue.
         """
         now = utc_now()
         with self.connect() as db:
-            db.execute("INSERT INTO controls(name,value,updated_at) VALUES('stats_reset_at',?,?) "
+            db.execute("BEGIN IMMEDIATE")
+            baseline = {row["state"]: row["count"] for row in db.execute(
+                f"SELECT state, COUNT(*) AS count FROM books WHERE state IN ({','.join('?' * len(OUTCOME_STATES))}) "
+                "GROUP BY state", OUTCOME_STATES)}
+            last_scan = db.execute("SELECT COALESCE(MAX(id), 0) FROM scans").fetchone()[0]
+            value = json.dumps({"at": now, "baseline": {s: baseline.get(s, 0) for s in OUTCOME_STATES},
+                                "scan_id": last_scan})
+            db.execute("INSERT INTO controls(name,value,updated_at) VALUES('stats_reset',?,?) "
                        "ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                       (now, now))
+                       (value, now))
             self._event(db, "statistics_reset", "GUI statistics reset; counters start from zero")
         return now
 
@@ -1694,16 +1713,17 @@ class BacklogStore:
             return self._progress_rows(db, [row], include_detected_pages=True)[0] if row else None
 
     def snapshot(self, event_limit: int = 100) -> dict:
-        reset_at = self.statistics_reset_at()
         with self.connect() as db:
+            reset = self._statistics_baseline(db)
+            reset_at = reset["at"] if reset else None
             scan = db.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
-            # Outcome states are cumulative history, so they count only changes
-            # since the last reset. Active states always count the real queue.
-            counts = {row["state"]: row["count"] for row in db.execute(
-                f"""SELECT state,COUNT(*) AS count FROM books
-                    WHERE ? IS NULL OR state NOT IN ({",".join("?" * len(OUTCOME_STATES))}) OR updated_at >= ?
-                    GROUP BY state""", (reset_at, *OUTCOME_STATES, reset_at))}
-            scan_after_reset = scan is not None and (reset_at is None or scan["created_at"] >= reset_at)
+            counts = {row["state"]: row["count"] for row in db.execute("SELECT state,COUNT(*) AS count FROM books GROUP BY state")}
+            if reset:
+                # Outcome states are cumulative history: show growth since the
+                # reset's baseline. Active states always count the real queue.
+                for state in OUTCOME_STATES:
+                    counts[state] = max(0, counts.get(state, 0) - reset["baseline"].get(state, 0))
+            scan_after_reset = scan is not None and (reset is None or scan["id"] > reset["scan_id"])
             current = db.execute("SELECT source_path,current_stage FROM books WHERE state='processing' ORDER BY started_at LIMIT 1").fetchone()
             recent = db.execute(
                 """SELECT * FROM books WHERE state IN ('processing','completed','failed','quarantined')
