@@ -51,6 +51,8 @@ IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp",
 QUEUE_PRIORITY_VERSION = 3
 DEFER_PAGE_COUNT = 350
 DEFER_SERIES_BOOK_COUNT = 6
+# Cumulative outcome states that the GUI's "Reset statistics" restarts from zero.
+OUTCOME_STATES = ("completed", "failed", "quarantined", "skipped")
 METHOD_TAG_PREFIX = "camelia:"
 PREVIOUS_DEFAULT_SEQUENCE = ("black_bars", "transparent_black", "white_bars")
 ACTIVE_STATES = ("queued", "processing")
@@ -944,6 +946,29 @@ class BacklogStore:
             row = db.execute("SELECT value FROM controls WHERE name='known_types_only'").fetchone()
             return bool(row and row["value"] == "enabled")
 
+    def statistics_reset_at(self) -> str | None:
+        """When the GUI statistics were last reset, or None if never."""
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM controls WHERE name='stats_reset_at'").fetchone()
+            return row["value"] if row else None
+
+    def reset_statistics(self) -> str:
+        """Start the GUI's outcome counters from zero (David, hive #6698, option A).
+
+        Only what the counters display changes: no book row, state, stage or
+        event is altered, so the queue and the marked-book skip are untouched.
+        After a reset, Completed/Failed/Issues/Skipped count books whose state
+        changed since then, and Found/Scanned/Eligible count only later scans.
+        Queued, held and processing always show the real queue.
+        """
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("INSERT INTO controls(name,value,updated_at) VALUES('stats_reset_at',?,?) "
+                       "ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                       (now, now))
+            self._event(db, "statistics_reset", "GUI statistics reset; counters start from zero")
+        return now
+
     def control_known_types_only(self, enabled: bool) -> None:
         with self.connect() as db:
             if db.execute("SELECT 1 FROM books WHERE state='processing' LIMIT 1").fetchone():
@@ -1669,9 +1694,16 @@ class BacklogStore:
             return self._progress_rows(db, [row], include_detected_pages=True)[0] if row else None
 
     def snapshot(self, event_limit: int = 100) -> dict:
+        reset_at = self.statistics_reset_at()
         with self.connect() as db:
             scan = db.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
-            counts = {row["state"]: row["count"] for row in db.execute("SELECT state,COUNT(*) AS count FROM books GROUP BY state")}
+            # Outcome states are cumulative history, so they count only changes
+            # since the last reset. Active states always count the real queue.
+            counts = {row["state"]: row["count"] for row in db.execute(
+                f"""SELECT state,COUNT(*) AS count FROM books
+                    WHERE ? IS NULL OR state NOT IN ({",".join("?" * len(OUTCOME_STATES))}) OR updated_at >= ?
+                    GROUP BY state""", (reset_at, *OUTCOME_STATES, reset_at))}
+            scan_after_reset = scan is not None and (reset_at is None or scan["created_at"] >= reset_at)
             current = db.execute("SELECT source_path,current_stage FROM books WHERE state='processing' ORDER BY started_at LIMIT 1").fetchone()
             recent = db.execute(
                 """SELECT * FROM books WHERE state IN ('processing','completed','failed','quarantined')
@@ -1694,6 +1726,12 @@ class BacklogStore:
                     **processing_window_status(),
                 },
                 "counts": {name: counts.get(name, 0) for name in ("discovered", "eligible", "queued", "held", "processing", "completed", "failed", "quarantined", "skipped")},
+                "stats_reset_at": reset_at,
+                "scan_totals": {
+                    "found": scan["total_found"] if scan_after_reset else 0,
+                    "scanned": scan["scanned_count"] if scan_after_reset else 0,
+                    "eligible": scan["eligible_count"] if scan_after_reset else 0,
+                },
                 "current_file": (
                     current["source_path"] if current else
                     scan["current_path"] if scan and scan["status"] in {"running", "paused"} else None
