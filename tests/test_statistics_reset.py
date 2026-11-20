@@ -72,6 +72,23 @@ class StatisticsResetTests(unittest.TestCase):
         for state in ("completed", "failed", "quarantined", "skipped"):
             self.assertEqual(self.counts()[state], 0, state)
 
+    def test_a_real_unchanged_crawl_through_record_archive_does_not_recount(self):
+        """Codex's probe: the public crawl path returns 'unchanged' and refreshes updated_at."""
+        from test_library_backlog import make_cbz
+        from library_backlog import inspect_cbz_eligibility
+        root = Path(self.temp.name) / "comix"
+        archive = root / "Real" / "Real.cbz"
+        make_cbz(archive, "<ComicInfo><Tags>camelia:black_bars</Tags></ComicInfo>")
+        scan = self.store.start_scan(str(root))
+        self.assertEqual(self.store.record_archive(scan, str(root), str(archive), archive.stat(), inspect_cbz_eligibility), "queued")
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET state='completed' WHERE source_path LIKE '%Real.cbz'")
+        self.store.reset_statistics()
+        self.assertEqual(self.counts()["completed"], 0)
+        again = self.store.start_scan(str(root))
+        self.assertEqual(self.store.record_archive(again, str(root), str(archive), archive.stat(), inspect_cbz_eligibility), "unchanged")
+        self.assertEqual(self.counts()["completed"], 0)
+
     def test_same_second_activity_is_ordered_by_the_baseline_not_the_clock(self):
         """Pre-reset rows stamped with the reset's own second don't count; a change after does."""
         reset_at = self.store.reset_statistics()
