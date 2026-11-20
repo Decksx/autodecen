@@ -1,8 +1,11 @@
-"""GUI 'Reset statistics' (David, hive #6698, option A): counters restart, no book record changes."""
-import sqlite3
+"""GUI 'Reset statistics' (David, hive #6698, option A): counters restart, no book record changes.
+
+The reset stores a per-outcome baseline and the last scan id, so neither an
+unchanged rescan (which refreshes updated_at) nor same-second timestamps can
+bring old outcomes back (codex-lead review of f573ea0).
+"""
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -25,12 +28,24 @@ class StatisticsResetTests(unittest.TestCase):
                 db.execute("""INSERT INTO books(source_path,root_path,file_size,mtime_ns,state,selected_sequence,
                               discovered_at,updated_at,source_key) VALUES(?,?,?,?,?,?,?,?,?)""",
                            (f"X:\\comix\\B{i}\\b{i}.cbz", "X:\\comix", 1, 1, state, "[]", OLD, OLD, f"x:\\comix\\b{i}\\b{i}.cbz"))
+        self.add_scan(500, 500, 120)
+
+    def add_scan(self, found, scanned, eligible, created=OLD):
+        with self.store.connect() as db:
             db.execute("INSERT INTO scans(root_path,status,total_found,scanned_count,eligible_count,created_at,updated_at) "
-                       "VALUES('X:\\comix','completed',500,500,120,?,?)", (OLD, OLD))
+                       "VALUES('X:\\comix','completed',?,?,?,?,?)", (found, scanned, eligible, created, created))
+
+    def set_state(self, book_id, state, updated_at=None):
+        with self.store.connect() as db:
+            db.execute("UPDATE books SET state=?, updated_at=? WHERE id=?",
+                       (state, updated_at or library_backlog.utc_now(), book_id))
 
     def books(self):
         with self.store.connect() as db:
             return [tuple(r) for r in db.execute("SELECT id, state, updated_at, source_path FROM books ORDER BY id")]
+
+    def counts(self):
+        return self.store.snapshot()["counts"]
 
     def test_before_any_reset_everything_counts(self):
         snap = self.store.snapshot()
@@ -49,28 +64,41 @@ class StatisticsResetTests(unittest.TestCase):
         self.assertEqual(snap["scan_totals"], {"found": 0, "scanned": 0, "eligible": 0})
         self.assertEqual(self.books(), before)  # no book record was touched
 
-    def test_changes_after_a_reset_are_counted(self):
+    def test_an_unchanged_rescan_does_not_bring_old_outcomes_back(self):
+        """A crawl's _reuse_unchanged refreshes updated_at without a state change."""
         self.store.reset_statistics()
-        time.sleep(1.1)  # utc_now has one-second resolution
-        later = library_backlog.utc_now()
         with self.store.connect() as db:
-            db.execute("UPDATE books SET state='completed', updated_at=? WHERE id=1", (later,))
-            db.execute("INSERT INTO scans(root_path,status,total_found,scanned_count,eligible_count,created_at,updated_at) "
-                       "VALUES('X:\\comix','running',7,3,1,?,?)", (later, later))
-        snap = self.store.snapshot()
-        self.assertEqual((snap["counts"]["completed"], snap["counts"]["queued"]), (1, 1))
-        self.assertEqual(snap["scan_totals"], {"found": 7, "scanned": 3, "eligible": 1})
+            db.execute("UPDATE books SET updated_at=?", (library_backlog.utc_now(),))
+        for state in ("completed", "failed", "quarantined", "skipped"):
+            self.assertEqual(self.counts()[state], 0, state)
 
-    def test_a_second_reset_moves_the_starting_point(self):
-        first = self.store.reset_statistics()
-        time.sleep(1.1)
+    def test_same_second_activity_is_ordered_by_the_baseline_not_the_clock(self):
+        """Pre-reset rows stamped with the reset's own second don't count; a change after does."""
+        reset_at = self.store.reset_statistics()
         with self.store.connect() as db:
-            db.execute("UPDATE books SET state='skipped', updated_at=? WHERE id=1", (library_backlog.utc_now(),))
-        self.assertEqual(self.store.snapshot()["counts"]["skipped"], 1)
-        time.sleep(1.1)
-        second = self.store.reset_statistics()
-        self.assertGreater(second, first)
-        self.assertEqual(self.store.snapshot()["counts"]["skipped"], 0)
+            db.execute("UPDATE books SET updated_at=? WHERE state IN ('completed','skipped')", (reset_at,))
+        self.assertEqual(self.counts()["completed"], 0)
+        self.set_state(1, "completed", updated_at=reset_at)  # same second, genuinely after the reset
+        self.assertEqual((self.counts()["completed"], self.counts()["queued"]), (1, 1))
+
+    def test_a_scan_started_in_the_reset_second_still_counts(self):
+        reset_at = self.store.reset_statistics()
+        self.add_scan(7, 3, 1, created=reset_at)
+        self.assertEqual(self.store.snapshot()["scan_totals"], {"found": 7, "scanned": 3, "eligible": 1})
+
+    def test_leaving_an_outcome_state_never_goes_negative(self):
+        self.store.reset_statistics()
+        self.set_state(8, "queued")  # a skipped book requeued
+        self.assertEqual((self.counts()["skipped"], self.counts()["queued"]), (0, 3))
+
+    def test_a_second_reset_moves_the_baseline(self):
+        self.store.reset_statistics()
+        self.set_state(1, "skipped")
+        self.assertEqual(self.counts()["skipped"], 1)
+        self.store.reset_statistics()
+        self.assertEqual(self.counts()["skipped"], 0)
+        self.set_state(2, "skipped")
+        self.assertEqual(self.counts()["skipped"], 1)
 
     def test_reset_records_an_event(self):
         self.store.reset_statistics()
